@@ -1,0 +1,223 @@
+"""
+Feature engineering module.
+
+Takes raw OHLCV data and produces feature vectors for the neural network.
+Each data point in the input window is turned into features, and the
+neural network input layer is automatically sized to match.
+
+Features computed per day:
+- Normalized OHLCV values (relative to window mean)
+- Daily returns (close-to-close % change)
+- Intraday range (high - low) / close
+- Gap (open vs previous close)
+- Volume change ratio
+- Simple moving averages (5, 10, 21 day)
+- Volatility (rolling std of returns)
+- RSI (14-day)
+- MACD signal
+- Sentiment score (from Anthropic API)
+
+The feature vector for a 3-month window is flattened into a single input vector.
+"""
+
+import logging
+
+import numpy as np
+import pandas as pd
+
+import config
+
+logger = logging.getLogger(__name__)
+
+
+def compute_technical_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute technical indicator features from OHLCV data.
+
+    Args:
+        df: DataFrame with columns: date, open, high, low, close, volume
+            Optionally: transactions, vwap
+
+    Returns:
+        DataFrame with additional feature columns added
+    """
+    feat = df.copy()
+
+    # Daily returns
+    feat["return"] = feat["close"].pct_change()
+
+    # Log returns (more normally distributed)
+    feat["log_return"] = np.log(feat["close"] / feat["close"].shift(1))
+
+    # Intraday range normalized by close
+    feat["intraday_range"] = (feat["high"] - feat["low"]) / feat["close"]
+
+    # Gap: open vs previous close
+    feat["gap"] = (feat["open"] - feat["close"].shift(1)) / feat["close"].shift(1)
+
+    # Volume change ratio
+    feat["volume_ratio"] = feat["volume"] / feat["volume"].rolling(5).mean()
+
+    # Simple moving averages (relative to current close)
+    for window in [5, 10, 21]:
+        sma = feat["close"].rolling(window).mean()
+        feat[f"sma_{window}_ratio"] = feat["close"] / sma
+
+    # Exponential moving averages
+    for span in [12, 26]:
+        ema = feat["close"].ewm(span=span).mean()
+        feat[f"ema_{span}_ratio"] = feat["close"] / ema
+
+    # MACD
+    ema_12 = feat["close"].ewm(span=12).mean()
+    ema_26 = feat["close"].ewm(span=26).mean()
+    macd_line = ema_12 - ema_26
+    signal_line = macd_line.ewm(span=9).mean()
+    feat["macd"] = (macd_line - signal_line) / feat["close"]
+
+    # Bollinger Band position
+    sma_20 = feat["close"].rolling(20).mean()
+    std_20 = feat["close"].rolling(20).std()
+    feat["bollinger_pos"] = (feat["close"] - sma_20) / (2 * std_20 + 1e-10)
+
+    # RSI (14-day)
+    delta = feat["close"].diff()
+    gain = delta.where(delta > 0, 0.0).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0.0)).rolling(14).mean()
+    rs = gain / (loss + 1e-10)
+    feat["rsi"] = (100 - (100 / (1 + rs))) / 100  # Normalize to [0, 1]
+
+    # Volatility (rolling standard deviation of returns)
+    feat["volatility_5"] = feat["return"].rolling(5).std()
+    feat["volatility_21"] = feat["return"].rolling(21).std()
+
+    # Average True Range (normalized)
+    high_low = feat["high"] - feat["low"]
+    high_close = (feat["high"] - feat["close"].shift(1)).abs()
+    low_close = (feat["low"] - feat["close"].shift(1)).abs()
+    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    feat["atr"] = true_range.rolling(14).mean() / feat["close"]
+
+    # Price position within day range
+    feat["close_position"] = (
+        (feat["close"] - feat["low"]) / (feat["high"] - feat["low"] + 1e-10)
+    )
+
+    # Volume-weighted metrics (if vwap available)
+    if "vwap" in feat.columns:
+        feat["vwap_ratio"] = feat["close"] / (feat["vwap"] + 1e-10)
+    else:
+        feat["vwap_ratio"] = 1.0
+
+    # Transaction intensity (if available)
+    if "transactions" in feat.columns:
+        feat["txn_ratio"] = (
+            feat["transactions"]
+            / (feat["transactions"].rolling(5).mean() + 1e-10)
+        )
+    else:
+        feat["txn_ratio"] = 1.0
+
+    return feat
+
+
+# Feature columns that we extract from the technical features DataFrame
+FEATURE_COLUMNS = [
+    "return", "log_return", "intraday_range", "gap", "volume_ratio",
+    "sma_5_ratio", "sma_10_ratio", "sma_21_ratio",
+    "ema_12_ratio", "ema_26_ratio",
+    "macd", "bollinger_pos", "rsi",
+    "volatility_5", "volatility_21", "atr",
+    "close_position", "vwap_ratio", "txn_ratio",
+]
+
+
+def build_feature_matrix(df: pd.DataFrame, sentiment_score: float = 0.0,
+                          lookback_days: int = None) -> np.ndarray:
+    """
+    Build the full feature matrix from OHLCV data.
+
+    Takes the last `lookback_days` of data, computes technical features,
+    and flattens into a single feature vector. Appends the sentiment score.
+
+    Args:
+        df: DataFrame with OHLCV columns (and date)
+        sentiment_score: Sentiment value from Anthropic API [-1, 1]
+        lookback_days: Number of days to include in the feature window
+                       (default: TRAINING_WINDOW_DAYS from config)
+
+    Returns:
+        1D numpy array: the feature vector for the neural network
+    """
+    lookback_days = lookback_days or config.TRAINING_WINDOW_DAYS
+
+    # Compute technical features
+    feat_df = compute_technical_features(df)
+
+    # Drop NaN rows from rolling calculations
+    feat_df = feat_df.dropna(subset=FEATURE_COLUMNS)
+
+    # Take the last lookback_days rows
+    if len(feat_df) > lookback_days:
+        feat_df = feat_df.tail(lookback_days)
+
+    # Extract feature columns
+    feature_matrix = feat_df[FEATURE_COLUMNS].values
+
+    # Replace any remaining NaN/inf with 0
+    feature_matrix = np.nan_to_num(feature_matrix, nan=0.0, posinf=1.0, neginf=-1.0)
+
+    # Flatten the 2D matrix (days x features) into a 1D vector
+    flat_features = feature_matrix.flatten()
+
+    # Append sentiment score at the end
+    flat_features = np.append(flat_features, sentiment_score)
+
+    return flat_features.astype(np.float32)
+
+
+def compute_targets(df: pd.DataFrame, current_idx: int) -> np.ndarray:
+    """
+    Compute the target values (actual future % price changes)
+    for each prediction horizon.
+
+    Args:
+        df: Full DataFrame with 'close' column
+        current_idx: Index position of the "current" day
+
+    Returns:
+        numpy array of shape (6,) with actual % changes (as fractions)
+        for horizons: 1 day, 4 days, 1 week, 2 weeks, 1 month, 3 months.
+        Returns None if not enough future data exists.
+    """
+    horizons = list(config.PREDICTION_HORIZONS.values())
+    current_close = df.iloc[current_idx]["close"]
+    targets = []
+
+    for h in horizons:
+        future_idx = current_idx + h
+        if future_idx >= len(df):
+            return None  # Not enough future data
+        future_close = df.iloc[future_idx]["close"]
+        pct_change = (future_close - current_close) / current_close
+        # Clamp to [-1, 1] to match tanh output range
+        pct_change = max(-1.0, min(1.0, pct_change))
+        targets.append(pct_change)
+
+    return np.array(targets, dtype=np.float32)
+
+
+def get_feature_count(lookback_days: int = None) -> int:
+    """
+    Calculate the total number of input features.
+
+    This equals (lookback_days * len(FEATURE_COLUMNS)) + 1 (for sentiment).
+
+    Args:
+        lookback_days: Number of lookback days
+
+    Returns:
+        Total feature count (= input_size for the neural network)
+    """
+    lookback_days = lookback_days or config.TRAINING_WINDOW_DAYS
+    return lookback_days * len(FEATURE_COLUMNS) + 1  # +1 for sentiment
