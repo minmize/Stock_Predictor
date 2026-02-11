@@ -1,0 +1,17 @@
+# Stock Predictor Dependencies
+
+# Neural network framework
+torch>=2.0.0
+
+# Data handling
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Massive (formerly Polygon.io) API client
+polygon-api-client>=1.13.0
+
+# S3 flat file access
+boto3>=1.28.0
+
+# Anthropic API for sentiment analysis
+anthropic>=0.25.0
