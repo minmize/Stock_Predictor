@@ -132,6 +132,13 @@ class SentimentEvaluator:
             logger.info(f"No news articles for {ticker}, returning neutral 0.0")
             return 0.0
 
+        # Limit to most recent 50 articles to stay within API token limits
+        if len(news_articles) > 50:
+            logger.info(
+                f"Trimming {len(news_articles)} articles to 50 for {ticker}"
+            )
+            news_articles = news_articles[:50]
+
         sector = self.get_sector(ticker)
 
         # Build the news summary for Claude
