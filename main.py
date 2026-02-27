@@ -3,19 +3,21 @@
 Stock Predictor - Neural Network Stock Price Prediction
 
 Two modes of operation:
-  1. train  - Download historical data, train the neural network
+  1. train  - Download historical data via REST API, train the neural network
   2. predict - Fetch recent data and output price predictions
 
 Uses:
-  - Massive (formerly Polygon.io) API for stock market data
+  - Massive (formerly Polygon.io) REST API for stock market data
   - Anthropic Claude API for news sentiment analysis
-  - PyTorch neural network with dynamic input sizing
+  - PyTorch neural network with universal weights (shared across all stocks)
+  - Sector one-hot encoding to differentiate stock types
 
 Usage:
-  python main.py train --ticker AAPL --start 2020-01 --end 2024-12
-  python main.py predict --ticker AAPL
-  python main.py train --ticker AAPL --start 2020-01 --end 2024-12 --use-rest
-  python main.py predict --ticker AAPL --no-sentiment
+  python main.py train --ticker AAPL --sector technology --start 2020-01 --end 2024-12
+  python main.py predict --ticker AAPL --sector technology
+  python main.py train --ticker AAPL --sector technology --start 2020-01 --end 2024-12 --incremental
+  python main.py predict --ticker AAPL --sector technology --no-sentiment
+  python main.py list
 """
 
 import argparse
@@ -38,29 +40,15 @@ def setup_logging(verbose: bool = False):
     )
 
 
-def validate_api_keys(mode: str, use_sentiment: bool, use_rest: bool = False):
+def validate_api_keys(mode: str, use_sentiment: bool):
     """Check that required API keys are configured."""
     errors = []
 
     if config.MASSIVE_API_KEY == "YOUR_MASSIVE_API_KEY_HERE":
-        if mode == "predict":
-            errors.append(
-                "MASSIVE_API_KEY not set in config.py "
-                "(required for REST API data fetching)"
-            )
-        elif mode == "train":
-            errors.append(
-                "MASSIVE_API_KEY not set in config.py "
-                "(required for data fetching)"
-            )
-
-    if mode == "train":
-        if (config.MASSIVE_S3_ACCESS_KEY == "YOUR_S3_ACCESS_KEY_HERE"
-                and not use_rest):
-            logging.warning(
-                "S3 keys not configured. Use --use-rest flag to fetch "
-                "training data via REST API instead of flat files."
-            )
+        errors.append(
+            "MASSIVE_API_KEY not set in config.py "
+            "(required for REST API data fetching)"
+        )
 
     if use_sentiment:
         if config.ANTHROPIC_API_KEY == "YOUR_ANTHROPIC_API_KEY_HERE":
@@ -80,6 +68,17 @@ def validate_api_keys(mode: str, use_sentiment: bool, use_rest: bool = False):
         sys.exit(1)
 
 
+def validate_sector(sector: str) -> str:
+    """Validate and normalize sector name."""
+    sector_lower = sector.lower()
+    if sector_lower not in config.SECTORS:
+        print(f"\nWarning: Unknown sector '{sector}'.")
+        print(f"Valid sectors: {', '.join(config.SECTORS)}")
+        print(f"Defaulting to 'other'.\n")
+        return "other"
+    return sector_lower
+
+
 def parse_year_month(date_str: str) -> tuple[int, int]:
     """Parse 'YYYY-MM' into (year, month)."""
     parts = date_str.split("-")
@@ -93,8 +92,9 @@ def cmd_train(args):
     start_year, start_month = parse_year_month(args.start)
     end_year, end_month = parse_year_month(args.end)
     use_sentiment = not args.no_sentiment
+    sector = validate_sector(args.sector)
 
-    validate_api_keys("train", use_sentiment, use_rest=args.use_rest)
+    validate_api_keys("train", use_sentiment)
 
     hidden_layers = None
     if args.hidden_layers:
@@ -104,7 +104,8 @@ def cmd_train(args):
     print(f"  TRAINING MODE - {args.ticker}")
     print(f"{'='*60}")
     print(f"  Data range:  {args.start} to {args.end}")
-    print(f"  Data source: {'REST API' if args.use_rest else 'S3 Flat Files'}")
+    print(f"  Sector:      {sector}")
+    print(f"  Model:       Universal (shared across all stocks)")
     print(f"  Sentiment:   {'Enabled' if use_sentiment else 'Disabled'}")
     print(f"  Hidden layers: {hidden_layers or config.HIDDEN_LAYERS}")
     print(f"  Epochs/window: {args.epochs}")
@@ -113,12 +114,12 @@ def cmd_train(args):
     if args.incremental:
         results = run_incremental_training(
             ticker=args.ticker,
+            sector=sector,
             start_year=start_year,
             start_month=start_month,
             end_year=end_year,
             end_month=end_month,
             hidden_layers=hidden_layers,
-            use_rest=args.use_rest,
             use_sentiment=use_sentiment,
             epochs_per_window=args.epochs,
         )
@@ -130,12 +131,12 @@ def cmd_train(args):
             print("\nTraining failed. Check logs for details.")
     else:
         trainer = StockTrainer(
-            args.ticker, hidden_layers=hidden_layers,
+            args.ticker, sector=sector, hidden_layers=hidden_layers,
             use_sentiment=use_sentiment,
         )
         result = trainer.run_full_training(
             start_year, start_month, end_year, end_month,
-            use_rest=args.use_rest, epochs=args.epochs,
+            epochs=args.epochs,
         )
         if result:
             print(f"\nTraining complete!")
@@ -151,6 +152,7 @@ def cmd_train(args):
 def cmd_predict(args):
     """Handle the 'predict' subcommand."""
     use_sentiment = not args.no_sentiment
+    sector = validate_sector(args.sector)
 
     validate_api_keys("predict", use_sentiment)
 
@@ -158,10 +160,10 @@ def cmd_predict(args):
     if args.hidden_layers:
         hidden_layers = [int(x) for x in args.hidden_layers.split(",")]
 
-    print(f"\nGenerating predictions for {args.ticker}...")
+    print(f"\nGenerating predictions for {args.ticker} (sector: {sector})...")
 
     predictor = StockPredictor(
-        args.ticker, hidden_layers=hidden_layers,
+        args.ticker, sector=sector, hidden_layers=hidden_layers,
         use_sentiment=use_sentiment,
     )
     result = predictor.predict()
@@ -172,36 +174,46 @@ def cmd_predict(args):
     else:
         print(
             f"\nPrediction failed for {args.ticker}. "
-            f"Ensure the model has been trained first."
+            f"Ensure the universal model has been trained first."
         )
 
-    # Check for saved models
+    # Check for saved model
     manager = ModelManager()
-    saved = manager.list_saved_models()
-    if saved and args.ticker not in saved:
-        print(f"\nAvailable trained models: {', '.join(saved)}")
-        print(f"Run: python main.py train --ticker {args.ticker} ... first")
+    if not manager.has_saved_model():
+        print("\nNo universal model found.")
+        print(f"Run: python main.py train --ticker {args.ticker} "
+              f"--sector {sector} --start YYYY-MM --end YYYY-MM")
 
 
 def cmd_list(args):
-    """Handle the 'list' subcommand - show saved models."""
+    """Handle the 'list' subcommand - show saved universal model info."""
     manager = ModelManager()
-    saved = manager.list_saved_models()
-    if saved:
-        print("\nSaved models:")
-        for ticker in saved:
-            model = manager.load_model(ticker)
-            if model:
-                info = model.get_architecture_info()
-                print(
-                    f"  {ticker}: {info['total_params']} params, "
-                    f"input={info['input_size']}, "
-                    f"hidden={info['hidden_layers']}"
-                )
-            else:
-                print(f"  {ticker}: (metadata only)")
+    if manager.has_saved_model():
+        model = manager.load_model()
+        if model:
+            info = model.get_architecture_info()
+            print("\nUniversal model:")
+            print(
+                f"  Parameters: {info['total_params']}, "
+                f"input={info['input_size']}, "
+                f"hidden={info['hidden_layers']}, "
+                f"output={info['num_outputs']}"
+            )
+            meta = manager.get_model_info()
+            if meta:
+                training_info = meta.get("training_info", {})
+                if training_info:
+                    print(f"  Last trained on: {training_info.get('ticker', '?')} "
+                          f"(sector: {training_info.get('sector', '?')})")
+                    print(f"  Samples: {training_info.get('num_samples', '?')}")
+                    print(f"  Best val loss: "
+                          f"{training_info.get('best_val_loss', '?')}")
+        else:
+            print("\nUniversal model found but could not be loaded.")
     else:
-        print("\nNo saved models found. Run training first.")
+        print("\nNo universal model found. Run training first.")
+
+    print(f"\nAvailable sectors: {', '.join(config.SECTORS)}")
 
 
 def main():
@@ -210,29 +222,34 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Train on AAPL using flat files from 2020 to 2024
-  python main.py train --ticker AAPL --start 2020-01 --end 2024-12
-
-  # Train using REST API (no S3 keys needed)
-  python main.py train --ticker AAPL --start 2023-01 --end 2024-12 --use-rest
+  # Train universal model on AAPL data
+  python main.py train --ticker AAPL --sector technology --start 2020-01 --end 2024-12
 
   # Train incrementally in 3-month windows
-  python main.py train --ticker AAPL --start 2020-01 --end 2024-12 --incremental
+  python main.py train --ticker AAPL --sector technology --start 2020-01 --end 2024-12 --incremental
+
+  # Train on another stock (same universal model continues learning)
+  python main.py train --ticker JPM --sector financial --start 2020-01 --end 2024-12
 
   # Train without sentiment analysis
-  python main.py train --ticker AAPL --start 2023-01 --end 2024-12 --no-sentiment --use-rest
+  python main.py train --ticker AAPL --sector technology --start 2023-01 --end 2024-12 --no-sentiment
 
-  # Predict current price movements
-  python main.py predict --ticker AAPL
+  # Predict current price movements (uses universal model)
+  python main.py predict --ticker AAPL --sector technology
 
   # Predict without sentiment
-  python main.py predict --ticker AAPL --no-sentiment
+  python main.py predict --ticker AAPL --sector technology --no-sentiment
 
   # Custom hidden layers
-  python main.py train --ticker AAPL --start 2023-01 --end 2024-12 --hidden-layers 256,128,64,16
+  python main.py train --ticker AAPL --sector technology --start 2023-01 --end 2024-12 --hidden-layers 256,128,64,16
 
-  # List saved models
+  # List saved model info
   python main.py list
+
+Available sectors:
+  technology, healthcare, financial, consumer_discretionary,
+  consumer_staples, energy, industrials, materials, utilities,
+  real_estate, communication, other
         """,
     )
 
@@ -244,16 +261,16 @@ Examples:
         "--ticker", "-t", required=True, help="Stock ticker symbol (e.g. AAPL)"
     )
     train_parser.add_argument(
+        "--sector", required=True,
+        help="Stock sector for one-hot encoding (e.g. technology, financial, healthcare)",
+    )
+    train_parser.add_argument(
         "--start", "-s", required=True,
         help="Start date in YYYY-MM format (e.g. 2020-01)",
     )
     train_parser.add_argument(
         "--end", "-e", required=True,
         help="End date in YYYY-MM format (e.g. 2024-12)",
-    )
-    train_parser.add_argument(
-        "--use-rest", action="store_true",
-        help="Use REST API instead of S3 flat files for data fetching",
     )
     train_parser.add_argument(
         "--incremental", action="store_true",
@@ -284,6 +301,10 @@ Examples:
         "--ticker", "-t", required=True, help="Stock ticker symbol (e.g. AAPL)"
     )
     predict_parser.add_argument(
+        "--sector", required=True,
+        help="Stock sector for one-hot encoding (e.g. technology, financial, healthcare)",
+    )
+    predict_parser.add_argument(
         "--no-sentiment", action="store_true",
         help="Disable sentiment analysis",
     )
@@ -297,7 +318,7 @@ Examples:
     predict_parser.set_defaults(func=cmd_predict)
 
     # --- List subcommand ---
-    list_parser = subparsers.add_parser("list", help="List saved models")
+    list_parser = subparsers.add_parser("list", help="List saved model info")
     list_parser.add_argument(
         "--verbose", "-v", action="store_true", help="Verbose logging",
     )

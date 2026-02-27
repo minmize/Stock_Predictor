@@ -7,6 +7,7 @@ Features:
 - 6 output nodes: predicted % price change for each time horizon
   (1 day, 4 days, 1 week, 2 weeks, 1 month, 3 months)
 - Output range: -100% to +100% (uses tanh activation scaled to [-1, 1])
+- Universal model: same weights used for all stocks (sector encoded as input)
 - Weight saving/loading to/from files
 """
 
@@ -112,7 +113,11 @@ class StockPredictorNet(nn.Module):
 
 class ModelManager:
     """
-    Manages model creation, saving, and loading.
+    Manages universal model creation, saving, and loading.
+
+    Uses a single set of weights for all stocks. Sector information
+    is encoded as part of the input feature vector, allowing the same
+    model to make predictions for any stock.
 
     Handles:
     - Creating a new model with the right input size
@@ -123,30 +128,30 @@ class ModelManager:
 
     def __init__(self, weights_dir: str = None):
         self.weights_dir = weights_dir or config.WEIGHTS_DIR
+        self.model_name = config.UNIVERSAL_MODEL_NAME
         os.makedirs(self.weights_dir, exist_ok=True)
 
-    def _weights_path(self, ticker: str) -> str:
-        """Get the weights file path for a ticker."""
-        return os.path.join(self.weights_dir, f"{ticker}_weights.pth")
+    def _weights_path(self) -> str:
+        """Get the universal weights file path."""
+        return os.path.join(self.weights_dir, f"{self.model_name}_weights.pth")
 
-    def _meta_path(self, ticker: str) -> str:
-        """Get the metadata file path for a ticker."""
-        return os.path.join(self.weights_dir, f"{ticker}_meta.pth")
+    def _meta_path(self) -> str:
+        """Get the universal metadata file path."""
+        return os.path.join(self.weights_dir, f"{self.model_name}_meta.pth")
 
-    def save_model(self, model: StockPredictorNet, ticker: str,
+    def save_model(self, model: StockPredictorNet,
                    feature_names: list[str] = None,
                    training_info: dict = None):
         """
-        Save model weights and architecture metadata.
+        Save universal model weights and architecture metadata.
 
         Args:
             model: The trained model
-            ticker: Ticker symbol (used in filename)
             feature_names: List of feature names for reproducibility
             training_info: Optional dict of training stats
         """
-        weights_path = self._weights_path(ticker)
-        meta_path = self._meta_path(ticker)
+        weights_path = self._weights_path()
+        meta_path = self._meta_path()
 
         # Save model state dict
         torch.save(model.state_dict(), weights_path)
@@ -161,31 +166,29 @@ class ModelManager:
         }
         torch.save(meta, meta_path)
 
-        logger.info(f"Model saved for {ticker} -> {weights_path}")
+        logger.info(f"Universal model saved -> {weights_path}")
 
-    def load_model(self, ticker: str,
-                   input_size: int = None,
+    def load_model(self, input_size: int = None,
                    hidden_layers: list[int] = None) -> Optional[StockPredictorNet]:
         """
-        Load a previously saved model.
+        Load the previously saved universal model.
 
         If input_size is provided and differs from the saved model,
         a new model is created (weights are NOT loaded as they're
         incompatible).
 
         Args:
-            ticker: Ticker symbol
             input_size: Expected input size (if known)
             hidden_layers: Hidden layer sizes (if overriding)
 
         Returns:
             Loaded StockPredictorNet, or None if no saved model exists
         """
-        weights_path = self._weights_path(ticker)
-        meta_path = self._meta_path(ticker)
+        weights_path = self._weights_path()
+        meta_path = self._meta_path()
 
         if not os.path.exists(weights_path):
-            logger.info(f"No saved weights found for {ticker}")
+            logger.info("No saved universal weights found")
             return None
 
         # Load metadata
@@ -202,13 +205,13 @@ class ModelManager:
 
         if effective_input is None:
             logger.warning(
-                f"Cannot load model for {ticker}: no input_size saved or provided"
+                "Cannot load universal model: no input_size saved or provided"
             )
             return None
 
         if input_size and saved_input_size and input_size != saved_input_size:
             logger.warning(
-                f"Input size mismatch for {ticker}: saved={saved_input_size}, "
+                f"Input size mismatch: saved={saved_input_size}, "
                 f"current={input_size}. Creating new model (weights discarded)."
             )
             return StockPredictorNet(input_size, effective_hidden)
@@ -219,36 +222,37 @@ class ModelManager:
         model.eval()
 
         logger.info(
-            f"Model loaded for {ticker}: input={effective_input}, "
+            f"Universal model loaded: input={effective_input}, "
             f"hidden={effective_hidden}"
         )
         return model
 
-    def get_or_create_model(self, ticker: str, input_size: int,
+    def get_or_create_model(self, input_size: int,
                             hidden_layers: list[int] = None) -> StockPredictorNet:
         """
-        Load existing model if compatible, or create a new one.
+        Load existing universal model if compatible, or create a new one.
 
         Args:
-            ticker: Ticker symbol
             input_size: Number of input features
             hidden_layers: Hidden layer config (optional override)
 
         Returns:
             StockPredictorNet ready for training or inference
         """
-        model = self.load_model(ticker, input_size, hidden_layers)
+        model = self.load_model(input_size, hidden_layers)
         if model is not None:
             return model
 
-        logger.info(f"Creating new model for {ticker} with input_size={input_size}")
+        logger.info(f"Creating new universal model with input_size={input_size}")
         return StockPredictorNet(input_size, hidden_layers)
 
-    def list_saved_models(self) -> list[str]:
-        """List all tickers that have saved weights."""
-        tickers = set()
-        if os.path.exists(self.weights_dir):
-            for f in os.listdir(self.weights_dir):
-                if f.endswith("_weights.pth"):
-                    tickers.add(f.replace("_weights.pth", ""))
-        return sorted(tickers)
+    def has_saved_model(self) -> bool:
+        """Check if a universal model has been saved."""
+        return os.path.exists(self._weights_path())
+
+    def get_model_info(self) -> Optional[dict]:
+        """Get metadata about the saved universal model."""
+        meta_path = self._meta_path()
+        if os.path.exists(meta_path):
+            return torch.load(meta_path, weights_only=False)
+        return None

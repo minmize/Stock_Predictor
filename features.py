@@ -16,8 +16,7 @@ Features computed per day:
 - RSI (14-day)
 - MACD signal
 - Sentiment score (from Anthropic API)
-
-The feature vector for a 3-month window is flattened into a single input vector.
+- Sector one-hot encoding (12 sectors)
 """
 
 import logging
@@ -132,17 +131,45 @@ FEATURE_COLUMNS = [
 ]
 
 
+def encode_sector(sector: str) -> np.ndarray:
+    """
+    One-hot encode a sector string.
+
+    Args:
+        sector: Sector name (must be in config.SECTORS)
+
+    Returns:
+        numpy array of shape (len(config.SECTORS),) with one-hot encoding
+    """
+    encoding = np.zeros(len(config.SECTORS), dtype=np.float32)
+    sector_lower = sector.lower()
+    if sector_lower in config.SECTORS:
+        idx = config.SECTORS.index(sector_lower)
+        encoding[idx] = 1.0
+    else:
+        # Default to "other"
+        encoding[config.SECTORS.index("other")] = 1.0
+        logger.warning(
+            f"Unknown sector '{sector}', defaulting to 'other'. "
+            f"Valid sectors: {config.SECTORS}"
+        )
+    return encoding
+
+
 def build_feature_matrix(df: pd.DataFrame, sentiment_score: float = 0.0,
+                          sector: str = "other",
                           lookback_days: int = None) -> np.ndarray:
     """
     Build the full feature matrix from OHLCV data.
 
     Takes the last `lookback_days` of data, computes technical features,
-    and flattens into a single feature vector. Appends the sentiment score.
+    and flattens into a single feature vector. Appends sector one-hot
+    encoding and sentiment score.
 
     Args:
         df: DataFrame with OHLCV columns (and date)
         sentiment_score: Sentiment value from Anthropic API [-1, 1]
+        sector: Sector name for one-hot encoding
         lookback_days: Number of days to include in the feature window
                        (default: TRAINING_WINDOW_DAYS from config)
 
@@ -169,6 +196,10 @@ def build_feature_matrix(df: pd.DataFrame, sentiment_score: float = 0.0,
 
     # Flatten the 2D matrix (days x features) into a 1D vector
     flat_features = feature_matrix.flatten()
+
+    # Append sector one-hot encoding
+    sector_encoding = encode_sector(sector)
+    flat_features = np.append(flat_features, sector_encoding)
 
     # Append sentiment score at the end
     flat_features = np.append(flat_features, sentiment_score)
@@ -211,7 +242,9 @@ def get_feature_count(lookback_days: int = None) -> int:
     """
     Calculate the total number of input features.
 
-    This equals (lookback_days * len(FEATURE_COLUMNS)) + 1 (for sentiment).
+    This equals (lookback_days * len(FEATURE_COLUMNS)) + len(SECTORS) + 1.
+    The +len(SECTORS) is for sector one-hot encoding.
+    The +1 is for sentiment.
 
     Args:
         lookback_days: Number of lookback days
@@ -220,4 +253,6 @@ def get_feature_count(lookback_days: int = None) -> int:
         Total feature count (= input_size for the neural network)
     """
     lookback_days = lookback_days or config.TRAINING_WINDOW_DAYS
-    return lookback_days * len(FEATURE_COLUMNS) + 1  # +1 for sentiment
+    return (lookback_days * len(FEATURE_COLUMNS)
+            + len(config.SECTORS)  # sector one-hot
+            + 1)  # sentiment

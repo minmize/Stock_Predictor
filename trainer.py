@@ -2,18 +2,21 @@
 Training mode module.
 
 Training process:
-1. Downloads historical data via Massive flat files (S3)
+1. Downloads historical data via Massive REST API
 2. Processes data in 3-month sliding windows
 3. For each window:
-   a. Computes features for the window
+   a. Computes features for the window (with sector one-hot encoding)
    b. Gets sentiment score (or uses neutral for historical)
    c. Runs forward pass through neural net
    d. Compares predictions vs actual future returns (the targets)
    e. Computes loss and backpropagates
-4. Saves weights to disk at the end of each run
+4. Saves universal weights to disk at the end of each run
+
+The model uses universal weights shared across all stocks. Sector
+information is encoded as a one-hot vector in the input features,
+allowing the model to learn sector-specific patterns.
 """
 
-import os
 import logging
 from datetime import datetime, timedelta
 from typing import Optional
@@ -31,6 +34,7 @@ from features import (
     build_feature_matrix,
     compute_targets,
     get_feature_count,
+    encode_sector,
     FEATURE_COLUMNS,
     compute_technical_features,
 )
@@ -44,18 +48,22 @@ class StockTrainer:
     Handles the full training pipeline for a stock ticker.
 
     Coordinates data fetching, feature engineering, training loop,
-    and model persistence.
+    and universal model persistence. The same model weights are used
+    for all stocks, with sector information encoded in the input.
     """
 
-    def __init__(self, ticker: str, hidden_layers: list[int] = None,
+    def __init__(self, ticker: str, sector: str = "other",
+                 hidden_layers: list[int] = None,
                  use_sentiment: bool = True):
         """
         Args:
             ticker: Stock ticker symbol (e.g. "AAPL")
+            sector: Sector name for one-hot encoding (e.g. "technology")
             hidden_layers: Optional override for hidden layer sizes
             use_sentiment: Whether to fetch and use sentiment scores
         """
         self.ticker = ticker
+        self.sector = sector
         self.hidden_layers = hidden_layers or list(config.HIDDEN_LAYERS)
         self.use_sentiment = use_sentiment
 
@@ -66,62 +74,17 @@ class StockTrainer:
         self.model = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    def fetch_training_data(self, start_year: int, start_month: int,
-                            end_year: int, end_month: int,
-                            use_cache: bool = True) -> Optional[any]:
+    def fetch_training_data(self, start_date: str,
+                            end_date: str) -> Optional[any]:
         """
-        Fetch historical data for training via flat files.
-
-        Tries to load from local cache first. If not available,
-        downloads from S3 and caches locally.
-
-        Args:
-            start_year: Start year for data
-            start_month: Start month
-            end_year: End year
-            end_month: End month
-            use_cache: Whether to use cached data
-
-        Returns:
-            Normalized pandas DataFrame, or None on failure
-        """
-        import pandas as pd
-
-        if use_cache:
-            cached = self.fetcher.load_cached_csv(self.ticker)
-            if cached is not None:
-                logger.info(f"Using cached data for {self.ticker}")
-                return normalize_dataframe(cached)
-
-        logger.info(
-            f"Downloading flat file data for {self.ticker} "
-            f"({start_year}/{start_month} -> {end_year}/{end_month})"
-        )
-        raw_df = self.fetcher.download_ticker_flat_files(
-            self.ticker, start_year, start_month, end_year, end_month
-        )
-
-        if raw_df.empty:
-            logger.error(f"No data fetched for {self.ticker}")
-            return None
-
-        # Cache to disk
-        self.fetcher.save_flat_data_to_csv(raw_df, self.ticker)
-
-        return normalize_dataframe(raw_df)
-
-    def fetch_training_data_rest(self, start_date: str,
-                                 end_date: str) -> Optional[any]:
-        """
-        Alternative: fetch training data via REST API instead of flat files.
-        Useful for smaller date ranges or when S3 access isn't configured.
+        Fetch historical data for training via REST API.
 
         Args:
             start_date: "YYYY-MM-DD"
             end_date: "YYYY-MM-DD"
 
         Returns:
-            Normalized pandas DataFrame
+            Normalized pandas DataFrame, or None on failure
         """
         df = self.fetcher.fetch_rest_aggregates(
             self.ticker, start_date, end_date
@@ -137,12 +100,11 @@ class StockTrainer:
 
         For each position where we have enough lookback data AND
         enough future data to compute targets, create one sample.
+        Sector one-hot encoding is appended to each feature vector.
 
         Args:
             df: Normalized DataFrame with full history
             sentiment_score: Sentiment score to use for all samples
-                           (or will be varied per window if we have
-                           historical sentiment)
 
         Returns:
             Tuple of (features_array, targets_array) as numpy arrays,
@@ -150,10 +112,6 @@ class StockTrainer:
         """
         window = config.TRAINING_WINDOW_DAYS
         max_horizon = max(config.PREDICTION_HORIZONS.values())
-
-        # We need at least window + some buffer for technical indicators
-        # (26 for EMA26, 20 for BB, 14 for RSI)
-        min_start = 30  # Buffer for indicator warm-up
 
         # Compute technical features on the full dataset once
         feat_df = compute_technical_features(df)
@@ -166,6 +124,9 @@ class StockTrainer:
             )
             return None, None
 
+        # Pre-compute sector encoding (same for all samples of this ticker)
+        sector_encoding = encode_sector(self.sector)
+
         features_list = []
         targets_list = []
 
@@ -177,8 +138,9 @@ class StockTrainer:
                 window_data, nan=0.0, posinf=1.0, neginf=-1.0
             )
 
-            # Flatten and append sentiment
+            # Flatten and append sector encoding + sentiment
             flat = window_data.flatten()
+            flat = np.append(flat, sector_encoding)
             flat = np.append(flat, sentiment_score)
             features_list.append(flat)
 
@@ -223,9 +185,9 @@ class StockTrainer:
 
         input_size = features.shape[1]
 
-        # Get or create model
+        # Get or create universal model
         self.model = self.model_manager.get_or_create_model(
-            self.ticker, input_size, self.hidden_layers
+            input_size, self.hidden_layers
         )
         self.model = self.model.to(self.device)
         self.model.train()
@@ -320,16 +282,19 @@ class StockTrainer:
             "epochs_run": epochs,
             "num_samples": len(features),
             "per_horizon_mae": per_horizon_mae,
+            "ticker": self.ticker,
+            "sector": self.sector,
         }
 
-        # Save model weights
+        # Save universal model weights
         feature_names = FEATURE_COLUMNS.copy()
+        feature_names.extend([f"sector_{s}" for s in config.SECTORS])
         feature_names.append("sentiment")
         self.model_manager.save_model(
-            self.model, self.ticker, feature_names, training_info
+            self.model, feature_names, training_info
         )
 
-        logger.info(f"Training complete for {self.ticker}")
+        logger.info(f"Training complete for {self.ticker} (sector: {self.sector})")
         logger.info(f"  Final train loss: {training_info['final_train_loss']:.6f}")
         logger.info(f"  Final val loss:   {training_info['final_val_loss']:.6f}")
         logger.info(f"  Per-horizon MAE:  {per_horizon_mae}")
@@ -338,11 +303,10 @@ class StockTrainer:
 
     def run_full_training(self, start_year: int, start_month: int,
                           end_year: int, end_month: int,
-                          use_rest: bool = False,
                           epochs: int = None) -> dict:
         """
         Run the complete training pipeline:
-        1. Fetch data (flat files or REST)
+        1. Fetch data via REST API
         2. Get sentiment score
         3. Prepare samples
         4. Train
@@ -352,21 +316,15 @@ class StockTrainer:
             start_month: Start month
             end_year: End year
             end_month: End month
-            use_rest: If True, use REST API instead of flat files
             epochs: Override number of epochs
 
         Returns:
             Training info dict, or None on failure
         """
-        # Step 1: Fetch data
-        if use_rest:
-            start_date = f"{start_year:04d}-{start_month:02d}-01"
-            end_date = f"{end_year:04d}-{end_month:02d}-28"
-            df = self.fetch_training_data_rest(start_date, end_date)
-        else:
-            df = self.fetch_training_data(
-                start_year, start_month, end_year, end_month
-            )
+        # Step 1: Fetch data via REST API
+        start_date = f"{start_year:04d}-{start_month:02d}-01"
+        end_date = f"{end_year:04d}-{end_month:02d}-28"
+        df = self.fetch_training_data(start_date, end_date)
 
         if df is None or df.empty:
             logger.error("Failed to fetch training data")
@@ -396,28 +354,28 @@ class StockTrainer:
         return self.train(features, targets, epochs=epochs)
 
 
-def run_incremental_training(ticker: str, start_year: int, start_month: int,
-                             end_year: int, end_month: int,
+def run_incremental_training(ticker: str, sector: str = "other",
+                             start_year: int = None, start_month: int = None,
+                             end_year: int = None, end_month: int = None,
                              hidden_layers: list[int] = None,
-                             use_rest: bool = False,
                              use_sentiment: bool = True,
                              epochs_per_window: int = None):
     """
-    Run training in 3-month incremental windows.
+    Run training in 3-month incremental windows via REST API.
 
     For each 3-month window:
     - Uses data up to that point as training data
     - The next 3 months serve as the target/validation period
-    - Model weights carry forward between windows
+    - Universal model weights carry forward between windows
 
     Args:
         ticker: Stock ticker symbol
+        sector: Sector name for one-hot encoding
         start_year: Data start year
         start_month: Data start month
         end_year: Data end year
         end_month: Data end month
         hidden_layers: Hidden layer sizes (optional)
-        use_rest: Use REST API instead of flat files
         use_sentiment: Enable sentiment analysis
         epochs_per_window: Epochs per 3-month training window
 
@@ -425,23 +383,19 @@ def run_incremental_training(ticker: str, start_year: int, start_month: int,
         List of training info dicts (one per window)
     """
     logger.info(
-        f"Starting incremental training for {ticker} "
+        f"Starting incremental training for {ticker} (sector: {sector}) "
         f"({start_year}/{start_month} -> {end_year}/{end_month})"
     )
 
     trainer = StockTrainer(
-        ticker, hidden_layers=hidden_layers, use_sentiment=use_sentiment
+        ticker, sector=sector, hidden_layers=hidden_layers,
+        use_sentiment=use_sentiment,
     )
 
-    # First, fetch ALL the data
-    if use_rest:
-        start_date = f"{start_year:04d}-{start_month:02d}-01"
-        end_date = f"{end_year:04d}-{end_month:02d}-28"
-        full_df = trainer.fetch_training_data_rest(start_date, end_date)
-    else:
-        full_df = trainer.fetch_training_data(
-            start_year, start_month, end_year, end_month
-        )
+    # Fetch ALL the data via REST API
+    start_date = f"{start_year:04d}-{start_month:02d}-01"
+    end_date = f"{end_year:04d}-{end_month:02d}-28"
+    full_df = trainer.fetch_training_data(start_date, end_date)
 
     if full_df is None or full_df.empty:
         logger.error("No data available for training")

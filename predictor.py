@@ -1,8 +1,9 @@
 """
 Prediction mode module.
 
-Uses the REST API to fetch the most recent 3 months of data,
-computes features, runs the trained neural network, and outputs
+Uses the REST API to fetch the most recent 6 months of data (enough for
+indicator warm-up + a full 63-day feature window), computes features with
+sector encoding, runs the universal trained neural network, and outputs
 predicted price movements for 6 time horizons.
 
 Also evaluates current market sentiment via the Anthropic API.
@@ -30,26 +31,31 @@ logger = logging.getLogger(__name__)
 
 class StockPredictor:
     """
-    Makes predictions for a stock ticker using a trained model.
+    Makes predictions for a stock ticker using the universal trained model.
 
     Workflow:
-    1. Fetches recent 3 months of daily data via REST API
+    1. Fetches recent 6 months of daily data via REST API
+       (6 months ensures enough data after indicator warm-up for
+       a full 63-day feature window)
     2. Evaluates current sentiment via Anthropic API
-    3. Builds feature vector
-    4. Loads trained model
+    3. Builds feature vector with sector encoding
+    4. Loads universal trained model
     5. Runs inference
     6. Outputs predictions
     """
 
-    def __init__(self, ticker: str, hidden_layers: list[int] = None,
+    def __init__(self, ticker: str, sector: str = "other",
+                 hidden_layers: list[int] = None,
                  use_sentiment: bool = True):
         """
         Args:
             ticker: Stock ticker symbol
+            sector: Sector name for one-hot encoding
             hidden_layers: Hidden layer config (must match training)
             use_sentiment: Whether to use sentiment analysis
         """
         self.ticker = ticker
+        self.sector = sector
         self.hidden_layers = hidden_layers or list(config.HIDDEN_LAYERS)
         self.use_sentiment = use_sentiment
 
@@ -66,6 +72,7 @@ class StockPredictor:
         Returns:
             Dict with keys:
             - ticker: str
+            - sector: str
             - current_price: float
             - predictions: dict mapping horizon name to predicted % change
             - sentiment_score: float
@@ -73,9 +80,10 @@ class StockPredictor:
             - timestamp: str
             Or None on failure.
         """
-        # Step 1: Fetch recent data via REST API
-        logger.info(f"Fetching recent 3 months of data for {self.ticker}")
-        raw_df = self.fetcher.fetch_recent_data(self.ticker, months=3)
+        # Step 1: Fetch recent data via REST API (6 months to ensure
+        # enough clean rows after indicator warm-up NaN dropping)
+        logger.info(f"Fetching recent 6 months of data for {self.ticker}")
+        raw_df = self.fetcher.fetch_recent_data(self.ticker, months=6)
 
         if raw_df is None or raw_df.empty:
             logger.error(f"No recent data available for {self.ticker}")
@@ -102,9 +110,10 @@ class StockPredictor:
             except Exception as e:
                 logger.warning(f"Sentiment evaluation failed: {e}")
 
-        # Step 3: Build feature vector
+        # Step 3: Build feature vector (with sector encoding)
         feature_vector = build_feature_matrix(
             df, sentiment_score=sentiment_score,
+            sector=self.sector,
             lookback_days=config.TRAINING_WINDOW_DAYS
         )
 
@@ -113,17 +122,29 @@ class StockPredictor:
             return None
 
         input_size = len(feature_vector)
-        logger.info(f"Feature vector size: {input_size}")
+        expected_size = get_feature_count()
+        logger.info(
+            f"Feature vector size: {input_size} (expected: {expected_size})"
+        )
 
-        # Step 4: Load trained model
+        if input_size != expected_size:
+            logger.error(
+                f"Feature vector size mismatch: got {input_size}, "
+                f"expected {expected_size}. This usually means not enough "
+                f"historical data was fetched. Need at least "
+                f"{config.TRAINING_WINDOW_DAYS + 30} trading days of raw data."
+            )
+            return None
+
+        # Step 4: Load universal trained model
         model = self.model_manager.load_model(
-            self.ticker, input_size=input_size, hidden_layers=self.hidden_layers
+            input_size=input_size, hidden_layers=self.hidden_layers
         )
 
         if model is None:
             logger.error(
-                f"No trained model found for {self.ticker}. "
-                f"Run training mode first."
+                "No trained universal model found. "
+                "Run training mode first with any stock."
             )
             return None
 
@@ -151,6 +172,7 @@ class StockPredictor:
 
         result = {
             "ticker": self.ticker,
+            "sector": self.sector,
             "current_price": round(current_price, 2),
             "predictions": predictions,
             "sentiment_score": round(sentiment_score, 3),
@@ -184,6 +206,7 @@ def format_prediction_report(result: dict) -> str:
     lines.append(f"  STOCK PREDICTION REPORT - {result['ticker']}")
     lines.append("=" * 60)
     lines.append(f"  Generated: {result['timestamp']}")
+    lines.append(f"  Sector: {result.get('sector', 'unknown')}")
     lines.append(
         f"  Data range: {result['data_range']['start_date']} to "
         f"{result['data_range']['end_date']} "
