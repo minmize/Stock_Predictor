@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.NeuralNetBuilder" parent="Theme.Material3.Dark.NoActionBar">
+        <item name="colorPrimary">@color/brand_primary</item>
+        <item name="colorPrimaryVariant">@color/brand_primary_variant</item>
+        <item name="colorSecondary">@color/brand_secondary</item>
+        <item name="colorSurface">@color/surface_card</item>
+        <item name="android:colorBackground">@color/surface_dark</item>
+        <item name="android:windowBackground">@color/surface_dark</item>
+        <item name="android:statusBarColor">@color/surface_dark</item>
+        <item name="android:navigationBarColor">@color/surface_dark</item>
+        <item name="android:windowLightStatusBar">false</item>
+
+        <!-- Text appearances -->
+        <item name="textAppearanceHeadlineLarge">@style/TextAppearance.NeuralNet.Headline</item>
+        <item name="textAppearanceBodyLarge">@style/TextAppearance.NeuralNet.Body</item>
+
+        <!-- Input fields -->
+        <item name="textInputStyle">@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox</item>
+        <item name="autoCompleteTextViewStyle">@style/Widget.MaterialComponents.AutoCompleteTextView.OutlinedBox</item>
+    </style>
+
+    <!-- Toolbar -->
+    <style name="Theme.NeuralNetBuilder.Toolbar" parent="Widget.Material3.Toolbar">
+        <item name="android:background">@color/surface_card</item>
+        <item name="titleTextColor">@color/text_primary</item>
+        <item name="subtitleTextColor">@color/text_secondary</item>
+    </style>
+
+    <!-- Text appearances -->
+    <style name="TextAppearance.NeuralNet.Headline" parent="TextAppearance.Material3.HeadlineLarge">
+        <item name="android:textColor">@color/text_primary</item>
+        <item name="android:fontFamily">sans-serif-medium</item>
+    </style>
+
+    <style name="TextAppearance.NeuralNet.Body" parent="TextAppearance.Material3.BodyLarge">
+        <item name="android:textColor">@color/text_secondary</item>
+    </style>
+
+    <!-- Cards -->
+    <style name="Widget.NeuralNet.Card" parent="Widget.Material3.CardView.Elevated">
+        <item name="cardBackgroundColor">@color/surface_card</item>
+        <item name="cardCornerRadius">16dp</item>
+        <item name="cardElevation">4dp</item>
+    </style>
+
+    <style name="Widget.NeuralNet.Card.Highlighted" parent="Widget.NeuralNet.Card">
+        <item name="cardBackgroundColor">@color/surface_elevated</item>
+    </style>
+
+    <!-- Buttons -->
+    <style name="Widget.NeuralNet.Button.Primary" parent="Widget.Material3.Button">
+        <item name="backgroundTint">@color/brand_primary</item>
+        <item name="android:textColor">@color/text_primary</item>
+        <item name="cornerRadius">12dp</item>
+        <item name="android:paddingTop">14dp</item>
+        <item name="android:paddingBottom">14dp</item>
+    </style>
+
+    <style name="Widget.NeuralNet.Button.Secondary" parent="Widget.Material3.Button.TonalButton">
+        <item name="backgroundTint">@color/surface_elevated</item>
+        <item name="android:textColor">@color/brand_accent</item>
+        <item name="cornerRadius">12dp</item>
+    </style>
+
+    <!-- Chips -->
+    <style name="Widget.NeuralNet.Chip" parent="Widget.Material3.Chip.Filter">
+        <item name="android:textColor">@color/text_primary</item>
+        <item name="chipBackgroundColor">@color/surface_elevated</item>
+        <item name="checkedIconTint">@color/brand_accent</item>
+    </style>
+
+    <!-- Bottom sheet for help dialogs -->
+    <style name="Theme.NeuralNet.BottomSheet" parent="ThemeOverlay.Material3.BottomSheetDialog">
+        <item name="android:colorBackground">@color/surface_card2</item>
+        <item name="bottomSheetStyle">@style/Widget.NeuralNet.BottomSheet</item>
+    </style>
+
+    <style name="Widget.NeuralNet.BottomSheet" parent="Widget.Material3.BottomSheet">
+        <item name="shapeAppearance">@style/ShapeAppearance.NeuralNet.BottomSheet</item>
+    </style>
+
+    <style name="ShapeAppearance.NeuralNet.BottomSheet" parent="">
+        <item name="cornerFamily">rounded</item>
+        <item name="cornerSizeTopLeft">20dp</item>
+        <item name="cornerSizeTopRight">20dp</item>
+    </style>
+</resources>
