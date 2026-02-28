@@ -6,6 +6,9 @@ indicator warm-up + a full 63-day feature window), computes features with
 sector encoding, runs the universal trained neural network, and outputs
 predicted price movements for 6 time horizons.
 
+Sector is automatically looked up via the Ticker Details API (SIC code)
+unless manually overridden via --sector.
+
 Also evaluates current market sentiment via the Anthropic API.
 """
 
@@ -34,28 +37,28 @@ class StockPredictor:
     Makes predictions for a stock ticker using the universal trained model.
 
     Workflow:
-    1. Fetches recent 6 months of daily data via REST API
+    1. Auto-detects sector via Ticker Details API (or uses override)
+    2. Fetches recent 6 months of daily data via REST API
        (6 months ensures enough data after indicator warm-up for
        a full 63-day feature window)
-    2. Evaluates current sentiment via Anthropic API
-    3. Builds feature vector with sector encoding
-    4. Loads universal trained model
-    5. Runs inference
-    6. Outputs predictions
+    3. Evaluates current sentiment via Anthropic API
+    4. Builds feature vector with sector encoding
+    5. Loads universal trained model
+    6. Runs inference
+    7. Outputs predictions
     """
 
-    def __init__(self, ticker: str, sector: str = "other",
+    def __init__(self, ticker: str, sector: str = None,
                  hidden_layers: list[int] = None,
                  use_sentiment: bool = True):
         """
         Args:
             ticker: Stock ticker symbol
-            sector: Sector name for one-hot encoding
+            sector: Sector override (if None, auto-detected via API)
             hidden_layers: Hidden layer config (must match training)
             use_sentiment: Whether to use sentiment analysis
         """
         self.ticker = ticker
-        self.sector = sector
         self.hidden_layers = hidden_layers or list(config.HIDDEN_LAYERS)
         self.use_sentiment = use_sentiment
 
@@ -64,6 +67,12 @@ class StockPredictor:
         self.sentiment_evaluator = SentimentEvaluator() if use_sentiment else None
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Auto-detect sector if not provided
+        if sector:
+            self.sector = sector
+        else:
+            self.sector = self.fetcher.fetch_ticker_sector(ticker)
 
     def predict(self) -> dict:
         """

@@ -16,7 +16,7 @@ ANTHROPIC_API_KEY = "YOUR_ANTHROPIC_API_KEY_HERE"
 ANTHROPIC_MODEL = "claude-sonnet-4-5-20250929"
 
 # ============================================================
-# Sector Definitions (for one-hot encoding in feature vector)
+# Sector Definitions (normalized index used as neural net input)
 # ============================================================
 SECTORS = [
     "technology",

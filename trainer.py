@@ -3,18 +3,19 @@ Training mode module.
 
 Training process:
 1. Downloads historical data via Massive REST API
-2. Processes data in 3-month sliding windows
-3. For each window:
-   a. Computes features for the window (with sector one-hot encoding)
-   b. Gets sentiment score (or uses neutral for historical)
-   c. Runs forward pass through neural net
-   d. Compares predictions vs actual future returns (the targets)
-   e. Computes loss and backpropagates
-4. Saves universal weights to disk at the end of each run
+2. Splits date range into 3-month batches (working backwards from end date)
+3. Discards any leftover time that doesn't fill a 3-month batch
+4. For each 3-month batch:
+   a. Fetches data for the batch
+   b. Computes features (with normalized sector value)
+   c. Builds training samples via sliding window
+   d. Trains the universal neural network
+   e. Weights carry forward between batches
+5. Saves universal weights to disk after each batch
 
 The model uses universal weights shared across all stocks. Sector
-information is encoded as a one-hot vector in the input features,
-allowing the model to learn sector-specific patterns.
+information is encoded as a single normalized value in the input features.
+Default training range is 4 years back from the current date.
 """
 
 import logging
@@ -29,7 +30,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 import config
 from data_fetcher import MassiveDataFetcher, normalize_dataframe
-from sentiment import SentimentEvaluator, get_training_sentiment
+from sentiment import SentimentEvaluator
 from features import (
     build_feature_matrix,
     compute_targets,
@@ -43,6 +44,35 @@ from neural_net import StockPredictorNet, ModelManager
 logger = logging.getLogger(__name__)
 
 
+def compute_3month_batches(end_date: datetime, start_date: datetime) -> list[tuple]:
+    """
+    Split a date range into 3-month batches, working backwards from end_date.
+    Discards any leftover time at the beginning that doesn't fill a full batch.
+
+    Args:
+        end_date: The latest date in the range
+        start_date: The earliest date in the range
+
+    Returns:
+        List of (batch_start, batch_end) datetime tuples, ordered
+        chronologically (earliest first).
+    """
+    batches = []
+    cursor = end_date
+
+    while True:
+        batch_start = cursor - timedelta(days=91)  # ~3 calendar months
+        if batch_start < start_date:
+            # Remaining time doesn't fill a 3-month batch; discard it
+            break
+        batches.append((batch_start, cursor))
+        cursor = batch_start
+
+    # Reverse so batches are chronological (train earliest first)
+    batches.reverse()
+    return batches
+
+
 class StockTrainer:
     """
     Handles the full training pipeline for a stock ticker.
@@ -50,6 +80,9 @@ class StockTrainer:
     Coordinates data fetching, feature engineering, training loop,
     and universal model persistence. The same model weights are used
     for all stocks, with sector information encoded in the input.
+
+    Training always proceeds in 3-month batches. If no dates are
+    specified, defaults to 4 years back from today.
     """
 
     def __init__(self, ticker: str, sector: str = "other",
@@ -58,7 +91,7 @@ class StockTrainer:
         """
         Args:
             ticker: Stock ticker symbol (e.g. "AAPL")
-            sector: Sector name for one-hot encoding (e.g. "technology")
+            sector: Sector name (e.g. "technology"), auto-detected if not given
             hidden_layers: Optional override for hidden layer sizes
             use_sentiment: Whether to fetch and use sentiment scores
         """
@@ -100,7 +133,7 @@ class StockTrainer:
 
         For each position where we have enough lookback data AND
         enough future data to compute targets, create one sample.
-        Sector one-hot encoding is appended to each feature vector.
+        Sector is appended as a single normalized value.
 
         Args:
             df: Normalized DataFrame with full history
@@ -124,8 +157,8 @@ class StockTrainer:
             )
             return None, None
 
-        # Pre-compute sector encoding (same for all samples of this ticker)
-        sector_encoding = encode_sector(self.sector)
+        # Pre-compute sector value (same for all samples of this ticker)
+        sector_value = encode_sector(self.sector)
 
         features_list = []
         targets_list = []
@@ -138,9 +171,9 @@ class StockTrainer:
                 window_data, nan=0.0, posinf=1.0, neginf=-1.0
             )
 
-            # Flatten and append sector encoding + sentiment
+            # Flatten and append sector value + sentiment
             flat = window_data.flatten()
-            flat = np.append(flat, sector_encoding)
+            flat = np.append(flat, sector_value)
             flat = np.append(flat, sentiment_score)
             features_list.append(flat)
 
@@ -163,11 +196,11 @@ class StockTrainer:
         )
         return features_array, targets_array
 
-    def train(self, features: np.ndarray, targets: np.ndarray,
-              epochs: int = None, learning_rate: float = None,
-              batch_size: int = None) -> dict:
+    def train_batch(self, features: np.ndarray, targets: np.ndarray,
+                    epochs: int = None, learning_rate: float = None,
+                    batch_size: int = None) -> dict:
         """
-        Run the training loop.
+        Run the training loop for one batch of data.
 
         Args:
             features: Feature matrix (num_samples, input_size)
@@ -286,53 +319,68 @@ class StockTrainer:
             "sector": self.sector,
         }
 
-        # Save universal model weights
+        # Save universal model weights after each batch
         feature_names = FEATURE_COLUMNS.copy()
-        feature_names.extend([f"sector_{s}" for s in config.SECTORS])
+        feature_names.append("sector")
         feature_names.append("sentiment")
         self.model_manager.save_model(
             self.model, feature_names, training_info
         )
 
-        logger.info(f"Training complete for {self.ticker} (sector: {self.sector})")
+        logger.info(f"Batch training complete for {self.ticker}")
         logger.info(f"  Final train loss: {training_info['final_train_loss']:.6f}")
         logger.info(f"  Final val loss:   {training_info['final_val_loss']:.6f}")
-        logger.info(f"  Per-horizon MAE:  {per_horizon_mae}")
 
         return training_info
 
-    def run_full_training(self, start_year: int, start_month: int,
-                          end_year: int, end_month: int,
-                          epochs: int = None) -> dict:
+    def run_training(self, end_date: datetime = None,
+                     start_date: datetime = None,
+                     epochs_per_batch: int = None) -> list[dict]:
         """
-        Run the complete training pipeline:
-        1. Fetch data via REST API
-        2. Get sentiment score
-        3. Prepare samples
-        4. Train
+        Run the complete training pipeline in 3-month batches.
+
+        Works backwards from end_date, splitting the range into 3-month
+        chunks. Any leftover time at the beginning that doesn't fill a
+        full 3-month batch is discarded. Batches are trained in
+        chronological order (earliest first).
 
         Args:
-            start_year: Start year of historical data
-            start_month: Start month
-            end_year: End year
-            end_month: End month
-            epochs: Override number of epochs
+            end_date: Latest date for training data (default: today)
+            start_date: Earliest date (default: 4 years before end_date)
+            epochs_per_batch: Epochs per 3-month batch
 
         Returns:
-            Training info dict, or None on failure
+            List of training info dicts (one per batch)
         """
-        # Step 1: Fetch data via REST API
-        start_date = f"{start_year:04d}-{start_month:02d}-01"
-        end_date = f"{end_year:04d}-{end_month:02d}-28"
-        df = self.fetch_training_data(start_date, end_date)
+        if end_date is None:
+            end_date = datetime.now()
+        if start_date is None:
+            start_date = end_date - timedelta(days=4 * 365)
 
-        if df is None or df.empty:
-            logger.error("Failed to fetch training data")
-            return None
+        # Compute 3-month batches working backwards from end_date
+        batches = compute_3month_batches(end_date, start_date)
 
-        logger.info(f"Fetched {len(df)} rows of data for {self.ticker}")
+        if not batches:
+            logger.error(
+                "Date range too short for any 3-month batches. "
+                f"Range: {start_date.date()} to {end_date.date()}"
+            )
+            return []
 
-        # Step 2: Get sentiment score
+        discarded_days = (batches[0][0] - start_date).days
+        if discarded_days > 0:
+            logger.info(
+                f"Discarding {discarded_days} days at the start that "
+                f"don't fill a 3-month batch"
+            )
+
+        logger.info(
+            f"Training {self.ticker} (sector: {self.sector}) in "
+            f"{len(batches)} batches of 3 months "
+            f"({batches[0][0].date()} to {batches[-1][1].date()})"
+        )
+
+        # Get sentiment score once for the entire run
         sentiment_score = 0.0
         if self.use_sentiment:
             try:
@@ -340,120 +388,63 @@ class StockTrainer:
                 sentiment_score = self.sentiment_evaluator.evaluate_sentiment(
                     self.ticker, news
                 )
-                logger.info(f"Sentiment score for {self.ticker}: {sentiment_score}")
+                logger.info(
+                    f"Sentiment score for {self.ticker}: {sentiment_score}"
+                )
             except Exception as e:
                 logger.warning(f"Sentiment evaluation failed: {e}")
 
-        # Step 3: Prepare training samples
-        features, targets = self.prepare_training_samples(df, sentiment_score)
-        if features is None:
-            logger.error("Failed to prepare training samples")
-            return None
+        all_results = []
 
-        # Step 4: Train
-        return self.train(features, targets, epochs=epochs)
+        for batch_num, (batch_start, batch_end) in enumerate(batches, 1):
+            start_str = batch_start.strftime("%Y-%m-%d")
+            end_str = batch_end.strftime("%Y-%m-%d")
 
-
-def run_incremental_training(ticker: str, sector: str = "other",
-                             start_year: int = None, start_month: int = None,
-                             end_year: int = None, end_month: int = None,
-                             hidden_layers: list[int] = None,
-                             use_sentiment: bool = True,
-                             epochs_per_window: int = None):
-    """
-    Run training in 3-month incremental windows via REST API.
-
-    For each 3-month window:
-    - Uses data up to that point as training data
-    - The next 3 months serve as the target/validation period
-    - Universal model weights carry forward between windows
-
-    Args:
-        ticker: Stock ticker symbol
-        sector: Sector name for one-hot encoding
-        start_year: Data start year
-        start_month: Data start month
-        end_year: Data end year
-        end_month: Data end month
-        hidden_layers: Hidden layer sizes (optional)
-        use_sentiment: Enable sentiment analysis
-        epochs_per_window: Epochs per 3-month training window
-
-    Returns:
-        List of training info dicts (one per window)
-    """
-    logger.info(
-        f"Starting incremental training for {ticker} (sector: {sector}) "
-        f"({start_year}/{start_month} -> {end_year}/{end_month})"
-    )
-
-    trainer = StockTrainer(
-        ticker, sector=sector, hidden_layers=hidden_layers,
-        use_sentiment=use_sentiment,
-    )
-
-    # Fetch ALL the data via REST API
-    start_date = f"{start_year:04d}-{start_month:02d}-01"
-    end_date = f"{end_year:04d}-{end_month:02d}-28"
-    full_df = trainer.fetch_training_data(start_date, end_date)
-
-    if full_df is None or full_df.empty:
-        logger.error("No data available for training")
-        return []
-
-    logger.info(f"Total data points: {len(full_df)}")
-
-    # Get sentiment (use same score for entire run)
-    sentiment_score = 0.0
-    if use_sentiment:
-        try:
-            news = trainer.fetcher.fetch_ticker_news(ticker, limit=20)
-            sentiment_score = trainer.sentiment_evaluator.evaluate_sentiment(
-                ticker, news
+            print(
+                f"\n{'='*60}\n"
+                f"  Batch {batch_num}/{len(batches)}: "
+                f"{start_str} to {end_str}\n"
+                f"{'='*60}"
             )
-        except Exception as e:
-            logger.warning(f"Sentiment failed, using neutral: {e}")
 
-    # Process in 3-month (63 trading days) windows
-    window_size = config.TRAINING_WINDOW_DAYS  # 63 days
-    max_horizon = max(config.PREDICTION_HORIZONS.values())  # 63 days
+            # Fetch data for this batch
+            df = self.fetch_training_data(start_str, end_str)
+            if df is None or df.empty:
+                logger.warning(
+                    f"No data for batch {batch_num} "
+                    f"({start_str} to {end_str}), skipping"
+                )
+                continue
 
-    all_results = []
-    window_start = 0
+            logger.info(f"Batch {batch_num}: {len(df)} rows of data")
 
-    while window_start + window_size + max_horizon <= len(full_df):
-        window_end = window_start + window_size + max_horizon
-        window_df = full_df.iloc[:window_end].copy().reset_index(drop=True)
+            # Prepare training samples
+            features, targets = self.prepare_training_samples(
+                df, sentiment_score
+            )
+            if features is None:
+                logger.warning(
+                    f"Insufficient data for batch {batch_num}, skipping"
+                )
+                continue
 
-        logger.info(
-            f"\n{'='*60}\n"
-            f"Training window: rows {window_start} to {window_end} "
-            f"(of {len(full_df)})\n"
-            f"{'='*60}"
-        )
-
-        features, targets = trainer.prepare_training_samples(
-            window_df, sentiment_score
-        )
-
-        if features is not None:
-            result = trainer.train(
-                features, targets, epochs=epochs_per_window
+            # Train on this batch (weights carry forward)
+            result = self.train_batch(
+                features, targets, epochs=epochs_per_batch
             )
             if result:
-                result["window_start"] = window_start
-                result["window_end"] = window_end
+                result["batch_num"] = batch_num
+                result["batch_start"] = start_str
+                result["batch_end"] = end_str
                 all_results.append(result)
 
-                # Print per-horizon results
-                print(f"\nWindow {len(all_results)} results:")
                 print(f"  Samples: {result['num_samples']}")
                 print(f"  Val Loss: {result['final_val_loss']:.6f}")
                 for h_name, mae in result["per_horizon_mae"].items():
                     print(f"  {h_name} MAE: {mae:.4f} ({mae*100:.2f}%)")
 
-        # Advance by 3 months (63 trading days)
-        window_start += window_size
-
-    logger.info(f"\nIncremental training complete. {len(all_results)} windows trained.")
-    return all_results
+        logger.info(
+            f"\nTraining complete. {len(all_results)}/{len(batches)} "
+            f"batches processed."
+        )
+        return all_results

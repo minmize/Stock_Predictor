@@ -3,19 +3,19 @@
 Stock Predictor - Neural Network Stock Price Prediction
 
 Two modes of operation:
-  1. train  - Download historical data via REST API, train the neural network
+  1. train  - Download historical data via REST API, train in 3-month batches
   2. predict - Fetch recent data and output price predictions
 
 Uses:
   - Massive (formerly Polygon.io) REST API for stock market data
   - Anthropic Claude API for news sentiment analysis
   - PyTorch neural network with universal weights (shared across all stocks)
-  - Sector one-hot encoding to differentiate stock types
+  - Sector auto-detected via Ticker Details API (SIC code), normalized to [0,1]
 
 Usage:
-  python main.py train --ticker AAPL --sector technology --start 2020-01 --end 2024-12
-  python main.py predict --ticker AAPL --sector technology
-  python main.py train --ticker AAPL --sector technology --start 2020-01 --end 2024-12 --incremental
+  python main.py train --ticker AAPL
+  python main.py train --ticker AAPL --start 2020-01 --end 2024-12
+  python main.py predict --ticker AAPL
   python main.py predict --ticker AAPL --sector technology --no-sentiment
   python main.py list
 """
@@ -23,9 +23,11 @@ Usage:
 import argparse
 import logging
 import sys
+from datetime import datetime, timedelta
 
 import config
-from trainer import StockTrainer, run_incremental_training
+from data_fetcher import MassiveDataFetcher
+from trainer import StockTrainer
 from predictor import StockPredictor, format_prediction_report
 from neural_net import ModelManager
 
@@ -68,15 +70,35 @@ def validate_api_keys(mode: str, use_sentiment: bool):
         sys.exit(1)
 
 
-def validate_sector(sector: str) -> str:
-    """Validate and normalize sector name."""
-    sector_lower = sector.lower()
-    if sector_lower not in config.SECTORS:
-        print(f"\nWarning: Unknown sector '{sector}'.")
+def resolve_sector(ticker: str, sector_override: str = None) -> str:
+    """
+    Resolve the sector for a ticker.
+
+    If sector_override is provided, validate and return it.
+    Otherwise auto-detect via the Ticker Details API.
+
+    Args:
+        ticker: Stock ticker symbol
+        sector_override: Manual sector override (optional)
+
+    Returns:
+        Validated sector name from config.SECTORS
+    """
+    if sector_override:
+        sector_lower = sector_override.lower()
+        if sector_lower in config.SECTORS:
+            return sector_lower
+        print(f"\nWarning: Unknown sector '{sector_override}'.")
         print(f"Valid sectors: {', '.join(config.SECTORS)}")
         print(f"Defaulting to 'other'.\n")
         return "other"
-    return sector_lower
+
+    # Auto-detect via API
+    print(f"  Looking up sector for {ticker} via API...")
+    fetcher = MassiveDataFetcher()
+    sector = fetcher.fetch_ticker_sector(ticker)
+    print(f"  Detected sector: {sector}")
+    return sector
 
 
 def parse_year_month(date_str: str) -> tuple[int, int]:
@@ -89,12 +111,24 @@ def parse_year_month(date_str: str) -> tuple[int, int]:
 
 def cmd_train(args):
     """Handle the 'train' subcommand."""
-    start_year, start_month = parse_year_month(args.start)
-    end_year, end_month = parse_year_month(args.end)
     use_sentiment = not args.no_sentiment
-    sector = validate_sector(args.sector)
-
     validate_api_keys("train", use_sentiment)
+
+    # Resolve dates: default to 4 years back from today
+    if args.end:
+        end_year, end_month = parse_year_month(args.end)
+        end_date = datetime(end_year, end_month, 28)
+    else:
+        end_date = datetime.now()
+
+    if args.start:
+        start_year, start_month = parse_year_month(args.start)
+        start_date = datetime(start_year, start_month, 1)
+    else:
+        start_date = end_date - timedelta(days=4 * 365)
+
+    # Resolve sector
+    sector = resolve_sector(args.ticker, args.sector)
 
     hidden_layers = None
     if args.hidden_layers:
@@ -103,58 +137,43 @@ def cmd_train(args):
     print(f"\n{'='*60}")
     print(f"  TRAINING MODE - {args.ticker}")
     print(f"{'='*60}")
-    print(f"  Data range:  {args.start} to {args.end}")
-    print(f"  Sector:      {sector}")
-    print(f"  Model:       Universal (shared across all stocks)")
-    print(f"  Sentiment:   {'Enabled' if use_sentiment else 'Disabled'}")
+    print(f"  Date range:    {start_date.date()} to {end_date.date()}")
+    print(f"  Sector:        {sector}")
+    print(f"  Model:         Universal (shared across all stocks)")
+    print(f"  Training:      3-month batches")
+    print(f"  Sentiment:     {'Enabled' if use_sentiment else 'Disabled'}")
     print(f"  Hidden layers: {hidden_layers or config.HIDDEN_LAYERS}")
-    print(f"  Epochs/window: {args.epochs}")
+    print(f"  Epochs/batch:  {args.epochs}")
     print(f"{'='*60}\n")
 
-    if args.incremental:
-        results = run_incremental_training(
-            ticker=args.ticker,
-            sector=sector,
-            start_year=start_year,
-            start_month=start_month,
-            end_year=end_year,
-            end_month=end_month,
-            hidden_layers=hidden_layers,
-            use_sentiment=use_sentiment,
-            epochs_per_window=args.epochs,
-        )
-        if results:
-            print(f"\nTraining complete! {len(results)} windows processed.")
-            final = results[-1]
-            print(f"Final validation loss: {final['final_val_loss']:.6f}")
-        else:
-            print("\nTraining failed. Check logs for details.")
+    trainer = StockTrainer(
+        args.ticker, sector=sector, hidden_layers=hidden_layers,
+        use_sentiment=use_sentiment,
+    )
+    results = trainer.run_training(
+        end_date=end_date,
+        start_date=start_date,
+        epochs_per_batch=args.epochs,
+    )
+
+    if results:
+        print(f"\nTraining complete! {len(results)} batches processed.")
+        final = results[-1]
+        print(f"Final validation loss: {final['final_val_loss']:.6f}")
+        print(f"Per-horizon MAE:")
+        for name, mae in final["per_horizon_mae"].items():
+            print(f"  {name}: {mae:.4f} ({mae*100:.2f}%)")
     else:
-        trainer = StockTrainer(
-            args.ticker, sector=sector, hidden_layers=hidden_layers,
-            use_sentiment=use_sentiment,
-        )
-        result = trainer.run_full_training(
-            start_year, start_month, end_year, end_month,
-            epochs=args.epochs,
-        )
-        if result:
-            print(f"\nTraining complete!")
-            print(f"  Final train loss: {result['final_train_loss']:.6f}")
-            print(f"  Final val loss:   {result['final_val_loss']:.6f}")
-            print(f"  Per-horizon MAE:")
-            for name, mae in result["per_horizon_mae"].items():
-                print(f"    {name}: {mae:.4f} ({mae*100:.2f}%)")
-        else:
-            print("\nTraining failed. Check logs for details.")
+        print("\nTraining failed. Check logs for details.")
 
 
 def cmd_predict(args):
     """Handle the 'predict' subcommand."""
     use_sentiment = not args.no_sentiment
-    sector = validate_sector(args.sector)
-
     validate_api_keys("predict", use_sentiment)
+
+    # Resolve sector (auto-detect or override)
+    sector = resolve_sector(args.ticker, args.sector)
 
     hidden_layers = None
     if args.hidden_layers:
@@ -181,8 +200,7 @@ def cmd_predict(args):
     manager = ModelManager()
     if not manager.has_saved_model():
         print("\nNo universal model found.")
-        print(f"Run: python main.py train --ticker {args.ticker} "
-              f"--sector {sector} --start YYYY-MM --end YYYY-MM")
+        print(f"Run: python main.py train --ticker {args.ticker}")
 
 
 def cmd_list(args):
@@ -222,26 +240,29 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Train universal model on AAPL data
-  python main.py train --ticker AAPL --sector technology --start 2020-01 --end 2024-12
+  # Train with defaults (4 years back, sector auto-detected)
+  python main.py train --ticker AAPL
 
-  # Train incrementally in 3-month windows
-  python main.py train --ticker AAPL --sector technology --start 2020-01 --end 2024-12 --incremental
+  # Train with specific date range
+  python main.py train --ticker AAPL --start 2020-01 --end 2024-12
+
+  # Train with sector override
+  python main.py train --ticker AAPL --sector technology
 
   # Train on another stock (same universal model continues learning)
-  python main.py train --ticker JPM --sector financial --start 2020-01 --end 2024-12
+  python main.py train --ticker JPM
 
   # Train without sentiment analysis
-  python main.py train --ticker AAPL --sector technology --start 2023-01 --end 2024-12 --no-sentiment
+  python main.py train --ticker AAPL --no-sentiment
 
-  # Predict current price movements (uses universal model)
+  # Predict (sector auto-detected, universal model)
+  python main.py predict --ticker AAPL
+
+  # Predict with sector override
   python main.py predict --ticker AAPL --sector technology
 
-  # Predict without sentiment
-  python main.py predict --ticker AAPL --sector technology --no-sentiment
-
   # Custom hidden layers
-  python main.py train --ticker AAPL --sector technology --start 2023-01 --end 2024-12 --hidden-layers 256,128,64,16
+  python main.py train --ticker AAPL --hidden-layers 256,128,64,16
 
   # List saved model info
   python main.py list
@@ -261,24 +282,21 @@ Available sectors:
         "--ticker", "-t", required=True, help="Stock ticker symbol (e.g. AAPL)"
     )
     train_parser.add_argument(
-        "--sector", required=True,
-        help="Stock sector for one-hot encoding (e.g. technology, financial, healthcare)",
+        "--sector",
+        help="Sector override (auto-detected via API if omitted). "
+             "Options: technology, healthcare, financial, etc.",
     )
     train_parser.add_argument(
-        "--start", "-s", required=True,
-        help="Start date in YYYY-MM format (e.g. 2020-01)",
+        "--start", "-s",
+        help="Start date in YYYY-MM format (default: 4 years before end date)",
     )
     train_parser.add_argument(
-        "--end", "-e", required=True,
-        help="End date in YYYY-MM format (e.g. 2024-12)",
-    )
-    train_parser.add_argument(
-        "--incremental", action="store_true",
-        help="Train incrementally in 3-month sliding windows",
+        "--end", "-e",
+        help="End date in YYYY-MM format (default: current date)",
     )
     train_parser.add_argument(
         "--epochs", type=int, default=config.EPOCHS_PER_WINDOW,
-        help=f"Epochs per training window (default: {config.EPOCHS_PER_WINDOW})",
+        help=f"Epochs per 3-month batch (default: {config.EPOCHS_PER_WINDOW})",
     )
     train_parser.add_argument(
         "--no-sentiment", action="store_true",
@@ -301,8 +319,8 @@ Available sectors:
         "--ticker", "-t", required=True, help="Stock ticker symbol (e.g. AAPL)"
     )
     predict_parser.add_argument(
-        "--sector", required=True,
-        help="Stock sector for one-hot encoding (e.g. technology, financial, healthcare)",
+        "--sector",
+        help="Sector override (auto-detected via API if omitted)",
     )
     predict_parser.add_argument(
         "--no-sentiment", action="store_true",
