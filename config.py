@@ -9,18 +9,29 @@ Fill in your API keys before running.
 # REST API key - obtain from https://massive.com/dashboard
 MASSIVE_API_KEY = "YOUR_MASSIVE_API_KEY_HERE"
 
-# S3 Flat Files credentials - obtain from your Massive dashboard
-MASSIVE_S3_ACCESS_KEY = "YOUR_S3_ACCESS_KEY_HERE"
-MASSIVE_S3_SECRET_KEY = "YOUR_S3_SECRET_KEY_HERE"
-MASSIVE_S3_ENDPOINT = "https://files.massive.com"
-MASSIVE_S3_BUCKET = "flatfiles"
-MASSIVE_FLAT_FILE_PREFIX = "us_stocks_sip/day_aggs_v1"
-
 # ============================================================
 # Anthropic API Configuration
 # ============================================================
 ANTHROPIC_API_KEY = "YOUR_ANTHROPIC_API_KEY_HERE"
 ANTHROPIC_MODEL = "claude-sonnet-4-5-20250929"
+
+# ============================================================
+# Sector Definitions (normalized index used as neural net input)
+# ============================================================
+SECTORS = [
+    "technology",
+    "healthcare",
+    "financial",
+    "consumer_discretionary",
+    "consumer_staples",
+    "energy",
+    "industrials",
+    "materials",
+    "utilities",
+    "real_estate",
+    "communication",
+    "other",
+]
 
 # ============================================================
 # Neural Network Defaults
@@ -44,6 +55,9 @@ LEARNING_RATE = 0.001
 EPOCHS_PER_WINDOW = 50
 BATCH_SIZE = 32
 TRAINING_WINDOW_DAYS = 63  # 3 months of trading days
+
+# Universal model name (same weights used for all stocks)
+UNIVERSAL_MODEL_NAME = "universal"
 
 # Paths
 WEIGHTS_DIR = "weights"
