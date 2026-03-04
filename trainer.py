@@ -2,16 +2,18 @@
 Training mode module.
 
 Training process:
-1. Downloads historical data via Massive REST API
-2. Splits date range into 3-month batches (working backwards from end date)
-3. Discards any leftover time that doesn't fill a 3-month batch
-4. For each 3-month batch:
-   a. Fetches data for the batch
-   b. Computes features (with normalized sector value)
-   c. Builds training samples via sliding window
-   d. Trains the universal neural network
-   e. Weights carry forward between batches
-5. Saves universal weights to disk after each batch
+1. Splits date range into 3-month batches (working backwards from end date)
+2. Discards any leftover time that doesn't fill a 3-month batch
+3. Fetches ALL data in one REST call (with buffers for indicator warm-up
+   at the start and forward targets at the end)
+4. Computes technical features once on the full dataset
+5. For each 3-month batch:
+   a. Selects anchor days that fall within the batch date range
+   b. Builds training samples using pre-computed features (63-day lookback)
+      and forward targets (up to 63 days ahead) from the full dataset
+   c. Trains the universal neural network
+   d. Weights carry forward between batches
+6. Saves universal weights to disk after each batch
 
 The model uses universal weights shared across all stocks. Sector
 information is encoded as a single normalized value in the input features.
@@ -32,14 +34,12 @@ import config
 from data_fetcher import MassiveDataFetcher, normalize_dataframe
 from sentiment import SentimentEvaluator
 from features import (
-    build_feature_matrix,
     compute_targets,
-    get_feature_count,
     encode_sector,
     FEATURE_COLUMNS,
     compute_technical_features,
 )
-from neural_net import StockPredictorNet, ModelManager
+from neural_net import ModelManager
 
 logger = logging.getLogger(__name__)
 
@@ -125,76 +125,6 @@ class StockTrainer:
         if df.empty:
             return None
         return normalize_dataframe(df)
-
-    def prepare_training_samples(self, df, sentiment_score: float = 0.0):
-        """
-        Slide a window across the historical data and build
-        (feature_vector, target) pairs.
-
-        For each position where we have enough lookback data AND
-        enough future data to compute targets, create one sample.
-        Sector is appended as a single normalized value.
-
-        Args:
-            df: Normalized DataFrame with full history
-            sentiment_score: Sentiment score to use for all samples
-
-        Returns:
-            Tuple of (features_array, targets_array) as numpy arrays,
-            or (None, None) if insufficient data
-        """
-        window = config.TRAINING_WINDOW_DAYS
-        max_horizon = max(config.PREDICTION_HORIZONS.values())
-
-        # Compute technical features on the full dataset once
-        feat_df = compute_technical_features(df)
-        feat_df = feat_df.dropna(subset=FEATURE_COLUMNS).reset_index(drop=True)
-
-        if len(feat_df) < window + max_horizon:
-            logger.warning(
-                f"Insufficient data for training: {len(feat_df)} rows, "
-                f"need at least {window + max_horizon}"
-            )
-            return None, None
-
-        # Pre-compute sector value (same for all samples of this ticker)
-        sector_value = encode_sector(self.sector)
-
-        features_list = []
-        targets_list = []
-
-        # Slide window through the data
-        for i in range(window, len(feat_df) - max_horizon):
-            # Extract the lookback window
-            window_data = feat_df.iloc[i - window:i][FEATURE_COLUMNS].values
-            window_data = np.nan_to_num(
-                window_data, nan=0.0, posinf=1.0, neginf=-1.0
-            )
-
-            # Flatten and append sector value + sentiment
-            flat = window_data.flatten()
-            flat = np.append(flat, sector_value)
-            flat = np.append(flat, sentiment_score)
-            features_list.append(flat)
-
-            # Compute targets from the original df (using feat_df indices)
-            target = compute_targets(feat_df, i)
-            if target is None:
-                features_list.pop()
-                continue
-            targets_list.append(target)
-
-        if not features_list:
-            return None, None
-
-        features_array = np.array(features_list, dtype=np.float32)
-        targets_array = np.array(targets_list, dtype=np.float32)
-
-        logger.info(
-            f"Prepared {len(features_array)} training samples, "
-            f"feature dim = {features_array.shape[1]}"
-        )
-        return features_array, targets_array
 
     def train_batch(self, features: np.ndarray, targets: np.ndarray,
                     epochs: int = None, learning_rate: float = None,
@@ -339,10 +269,20 @@ class StockTrainer:
         """
         Run the complete training pipeline in 3-month batches.
 
-        Works backwards from end_date, splitting the range into 3-month
-        chunks. Any leftover time at the beginning that doesn't fill a
-        full 3-month batch is discarded. Batches are trained in
-        chronological order (earliest first).
+        Data flow:
+        1. Compute the "trainable" anchor range: start_date to
+           (end_date - max_horizon), since anchor days need forward
+           data to compute target prices.
+        2. Split the anchor range into 3-month batches (backwards
+           from the end, earliest-first). Leftover time at the start
+           that doesn't fill a full batch is discarded.
+        3. Fetch ALL data in one API call: from (first_batch_start
+           - warmup - lookback) to end_date.
+        4. Compute technical features once on the full dataset.
+        5. For each batch, select anchor days within its date range,
+           build samples using the pre-computed features (63-day
+           lookback) and forward targets (up to 63 days ahead).
+        6. Train on each batch; weights carry forward.
 
         Args:
             end_date: Latest date for training data (default: today)
@@ -357,12 +297,24 @@ class StockTrainer:
         if start_date is None:
             start_date = end_date - timedelta(days=4 * 365)
 
-        # Compute 3-month batches working backwards from end_date
-        batches = compute_3month_batches(end_date, start_date)
+        window = config.TRAINING_WINDOW_DAYS
+        max_horizon = max(config.PREDICTION_HORIZONS.values())
+
+        # ----------------------------------------------------------
+        # Anchor days need max_horizon days of FUTURE data for targets.
+        # So the last valid anchor day is ~max_horizon trading days
+        # before end_date. Reserve that tail for forward targets only.
+        # ----------------------------------------------------------
+        target_reserve = timedelta(days=int(max_horizon * 1.5))  # calendar days
+        anchor_end = end_date - target_reserve
+
+        # Compute 3-month batches over the trainable anchor range
+        batches = compute_3month_batches(anchor_end, start_date)
 
         if not batches:
             logger.error(
                 "Date range too short for any 3-month batches. "
+                f"Need at least ~6 months for one batch + forward targets. "
                 f"Range: {start_date.date()} to {end_date.date()}"
             )
             return []
@@ -376,11 +328,58 @@ class StockTrainer:
 
         logger.info(
             f"Training {self.ticker} (sector: {self.sector}) in "
-            f"{len(batches)} batches of 3 months "
-            f"({batches[0][0].date()} to {batches[-1][1].date()})"
+            f"{len(batches)} batches of 3 months"
+        )
+        logger.info(
+            f"  Anchor range: {batches[0][0].date()} to "
+            f"{batches[-1][1].date()}"
+        )
+        logger.info(
+            f"  Forward target data extends to: {end_date.date()}"
         )
 
-        # Get sentiment score once for the entire run
+        # ----------------------------------------------------------
+        # Fetch ALL data in one shot:
+        #   - Before first batch: warmup (~30 rows) + lookback (63 rows)
+        #   - After last batch: forward targets up to end_date
+        # ----------------------------------------------------------
+        warmup_lookback = timedelta(days=int((30 + window) * 1.6))
+        fetch_start = (batches[0][0] - warmup_lookback).strftime("%Y-%m-%d")
+        fetch_end = end_date.strftime("%Y-%m-%d")
+
+        logger.info(f"Fetching full dataset: {fetch_start} to {fetch_end}")
+        df = self.fetch_training_data(fetch_start, fetch_end)
+        if df is None or df.empty:
+            logger.error("Failed to fetch training data")
+            return []
+
+        logger.info(f"Total rows fetched: {len(df)}")
+
+        # Compute technical features once on the full dataset
+        feat_df = compute_technical_features(df)
+        feat_df = feat_df.dropna(subset=FEATURE_COLUMNS).reset_index(drop=True)
+        logger.info(f"Clean rows after indicator warm-up: {len(feat_df)}")
+
+        if len(feat_df) < window + max_horizon:
+            logger.error(
+                f"Not enough clean data: {len(feat_df)} rows, "
+                f"need at least {window + max_horizon}. "
+                f"Try a longer date range or a ticker with more history."
+            )
+            return []
+
+        # Log the valid training range for diagnostics
+        first_valid_idx = window
+        last_valid_idx = len(feat_df) - max_horizon - 1
+        logger.info(
+            f"Valid anchor range in data: index {first_valid_idx} "
+            f"to {last_valid_idx} "
+            f"({last_valid_idx - first_valid_idx + 1} positions, "
+            f"dates {feat_df.iloc[first_valid_idx]['date'].date()} "
+            f"to {feat_df.iloc[last_valid_idx]['date'].date()})"
+        )
+
+        # Get sentiment once for the entire run
         sentiment_score = 0.0
         if self.use_sentiment:
             try:
@@ -394,7 +393,11 @@ class StockTrainer:
             except Exception as e:
                 logger.warning(f"Sentiment evaluation failed: {e}")
 
+        # Pre-compute values used for all batches
+        sector_value = encode_sector(self.sector)
+
         all_results = []
+        total_samples = 0
 
         for batch_num, (batch_start, batch_end) in enumerate(batches, 1):
             start_str = batch_start.strftime("%Y-%m-%d")
@@ -407,26 +410,67 @@ class StockTrainer:
                 f"{'='*60}"
             )
 
-            # Fetch data for this batch
-            df = self.fetch_training_data(start_str, end_str)
-            if df is None or df.empty:
-                logger.warning(
-                    f"No data for batch {batch_num} "
-                    f"({start_str} to {end_str}), skipping"
-                )
-                continue
-
-            logger.info(f"Batch {batch_num}: {len(df)} rows of data")
-
-            # Prepare training samples
-            features, targets = self.prepare_training_samples(
-                df, sentiment_score
+            # Find rows whose date falls within this batch's range.
+            # These are the "anchor" days we build training samples around.
+            batch_mask = (
+                (feat_df["date"] >= batch_start)
+                & (feat_df["date"] <= batch_end)
             )
-            if features is None:
+            batch_indices = feat_df.index[batch_mask].tolist()
+
+            # Keep only positions with enough lookback AND forward data
+            valid_indices = [
+                i for i in batch_indices
+                if i >= window and i + max_horizon < len(feat_df)
+            ]
+
+            if not valid_indices:
                 logger.warning(
-                    f"Insufficient data for batch {batch_num}, skipping"
+                    f"Batch {batch_num}: {len(batch_indices)} days in range, "
+                    f"0 valid anchor positions — skipping"
                 )
                 continue
+
+            logger.info(
+                f"Batch {batch_num}: {len(batch_indices)} days in range, "
+                f"{len(valid_indices)} valid anchor positions"
+            )
+
+            # Build feature vectors and targets for this batch
+            features_list = []
+            targets_list = []
+
+            for i in valid_indices:
+                # 63-day lookback window of pre-computed features
+                window_data = feat_df.iloc[i - window:i][FEATURE_COLUMNS].values
+                window_data = np.nan_to_num(
+                    window_data, nan=0.0, posinf=1.0, neginf=-1.0
+                )
+
+                flat = window_data.flatten()
+                flat = np.append(flat, sector_value)
+                flat = np.append(flat, sentiment_score)
+
+                # Forward-looking targets
+                target = compute_targets(feat_df, i)
+                if target is not None:
+                    features_list.append(flat)
+                    targets_list.append(target)
+
+            if not features_list:
+                logger.warning(
+                    f"Batch {batch_num}: no valid samples — skipping"
+                )
+                continue
+
+            features = np.array(features_list, dtype=np.float32)
+            targets = np.array(targets_list, dtype=np.float32)
+            total_samples += len(features)
+
+            logger.info(
+                f"Batch {batch_num}: {len(features)} training samples, "
+                f"feature dim = {features.shape[1]}"
+            )
 
             # Train on this batch (weights carry forward)
             result = self.train_batch(
@@ -443,8 +487,12 @@ class StockTrainer:
                 for h_name, mae in result["per_horizon_mae"].items():
                     print(f"  {h_name} MAE: {mae:.4f} ({mae*100:.2f}%)")
 
-        logger.info(
+        print(
             f"\nTraining complete. {len(all_results)}/{len(batches)} "
-            f"batches processed."
+            f"batches processed, {total_samples} total samples."
+        )
+        logger.info(
+            f"Training complete. {len(all_results)}/{len(batches)} "
+            f"batches processed, {total_samples} total samples."
         )
         return all_results

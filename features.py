@@ -5,16 +5,26 @@ Takes raw OHLCV data and produces feature vectors for the neural network.
 Each data point in the input window is turned into features, and the
 neural network input layer is automatically sized to match.
 
-Features computed per day:
-- Normalized OHLCV values (relative to window mean)
-- Daily returns (close-to-close % change)
+Features computed per day (27 indicators):
+- Daily returns (close-to-close % change, log returns)
 - Intraday range (high - low) / close
 - Gap (open vs previous close)
 - Volume change ratio
 - Simple moving averages (5, 10, 21 day)
-- Volatility (rolling std of returns)
-- RSI (14-day)
+- Exponential moving averages (12, 26 day)
 - MACD signal
+- Bollinger Band position
+- RSI (14-day)
+- Volatility (rolling std of returns, 5 and 21 day)
+- Average True Range (14-day)
+- Close position within daily range
+- VWAP ratio, transaction intensity ratio
+- Rate of Change (5, 10 day momentum)
+- Stochastic Oscillator (%K, %D)
+- Williams %R
+- On-Balance Volume ratio
+- Money Flow Index (14-day)
+- Chaikin Money Flow (20-day)
 - Sector value (normalized index into standard sector array, 0 to 1)
 - Sentiment score (from Anthropic API)
 """
@@ -117,6 +127,48 @@ def compute_technical_features(df: pd.DataFrame) -> pd.DataFrame:
     else:
         feat["txn_ratio"] = 1.0
 
+    # --- Additional momentum & volume indicators ---
+
+    # Rate of Change (momentum)
+    feat["roc_5"] = feat["close"].pct_change(5)
+    feat["roc_10"] = feat["close"].pct_change(10)
+
+    # Stochastic Oscillator (14-day)
+    lowest_14 = feat["low"].rolling(14).min()
+    highest_14 = feat["high"].rolling(14).max()
+    feat["stoch_k"] = (
+        (feat["close"] - lowest_14) / (highest_14 - lowest_14 + 1e-10)
+    )
+    feat["stoch_d"] = feat["stoch_k"].rolling(3).mean()
+
+    # Williams %R (14-day), normalized to [0, 1]
+    feat["williams_r"] = (
+        (highest_14 - feat["close"]) / (highest_14 - lowest_14 + 1e-10)
+    )
+
+    # On-Balance Volume (normalized as ratio to its own moving average)
+    obv = (np.sign(feat["close"].diff()) * feat["volume"]).fillna(0).cumsum()
+    feat["obv_ratio"] = obv / (obv.rolling(21).mean().abs() + 1e-10)
+
+    # Money Flow Index (14-day), normalized to [0, 1]
+    typical_price = (feat["high"] + feat["low"] + feat["close"]) / 3
+    money_flow = typical_price * feat["volume"]
+    positive_flow = money_flow.where(typical_price.diff() > 0, 0).rolling(14).sum()
+    negative_flow = money_flow.where(typical_price.diff() <= 0, 0).rolling(14).sum()
+    feat["mfi"] = (
+        100 - 100 / (1 + positive_flow / (negative_flow + 1e-10))
+    ) / 100
+
+    # Chaikin Money Flow (20-day)
+    mf_multiplier = (
+        ((feat["close"] - feat["low"]) - (feat["high"] - feat["close"]))
+        / (feat["high"] - feat["low"] + 1e-10)
+    )
+    mf_volume = mf_multiplier * feat["volume"]
+    feat["cmf"] = (
+        mf_volume.rolling(20).sum() / (feat["volume"].rolling(20).sum() + 1e-10)
+    )
+
     return feat
 
 
@@ -128,6 +180,8 @@ FEATURE_COLUMNS = [
     "macd", "bollinger_pos", "rsi",
     "volatility_5", "volatility_21", "atr",
     "close_position", "vwap_ratio", "txn_ratio",
+    "roc_5", "roc_10", "stoch_k", "stoch_d",
+    "williams_r", "obv_ratio", "mfi", "cmf",
 ]
 
 
