@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">NeuroBuilder</string>
+
+    <!-- Main screen -->
+    <string name="main_tagline">Build, Train &amp; Understand\nNeural Networks</string>
+    <string name="btn_learn">📚 Learn the Basics</string>
+    <string name="btn_build">🔨 Build a Network</string>
+    <string name="btn_quick_start">⚡ Quick Start</string>
+    <string name="learn_desc">8 beginner-friendly chapters covering AI, neurons, training &amp; more.</string>
+    <string name="build_desc">Design your own neural network — just type the layer structure!</string>
+    <string name="quick_desc">Jump straight in with a pre-made starter network.</string>
+
+    <!-- Tutorial -->
+    <string name="tutorial_prev">← Prev</string>
+    <string name="tutorial_next">Next →</string>
+    <string name="chapter_complete">Chapter Complete!</string>
+
+    <!-- Network Builder -->
+    <string name="builder_hint">Type structure: e.g. 4-64-32-1</string>
+    <string name="builder_help">Dash-separated list of neuron counts per layer.\nFirst = input, last = output, middle = hidden.</string>
+    <string name="add_layer">+ Add Hidden Layer</string>
+    <string name="next_data">Next: Load Data →</string>
+    <string name="show_summary">View Summary</string>
+
+    <!-- Data Input -->
+    <string name="upload_file">📂 Upload CSV File</string>
+    <string name="use_sample">🔬 Use Sample Data (XOR)</string>
+    <string name="feature_cols_hint">Select Feature Columns (inputs to the network)</string>
+    <string name="target_cols_hint">Select Target Column (what the network predicts)</string>
+    <string name="next_train">Next: Train Network →</string>
+
+    <!-- Training -->
+    <string name="start_training">▶ Start Training</string>
+    <string name="stop_training">⏹ Stop</string>
+    <string name="view_results">📊 View Results</string>
+    <string name="epoch_label">Epoch</string>
+    <string name="loss_chart_title">Loss Over Epochs</string>
+    <string name="acc_chart_title">Accuracy Over Epochs</string>
+
+    <!-- Results -->
+    <string name="predict_btn">Predict →</string>
+    <string name="prediction_hint_template">Enter comma-separated feature values</string>
+</resources>
