@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="20dp">
+
+        <!-- Emoji + Title -->
+        <TextView
+            android:id="@+id/pageEmoji"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="🧠"
+            android:textSize="48sp"
+            android:gravity="center"
+            android:layout_marginBottom="12dp"/>
+
+        <TextView
+            android:id="@+id/pageTitle"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Page Title"
+            android:textColor="@color/text_primary"
+            android:textSize="22sp"
+            android:fontFamily="sans-serif-medium"
+            android:gravity="center"
+            android:layout_marginBottom="20dp"/>
+
+        <!-- Visual diagram placeholder -->
+        <com.google.android.material.card.MaterialCardView
+            android:id="@+id/visualContainer"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            style="@style/Widget.NeuralNet.Card.Highlighted"
+            android:layout_marginBottom="20dp"
+            android:visibility="gone">
+
+            <TextView
+                android:id="@+id/visualLabel"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="[ Visual ]"
+                android:textColor="@color/brand_accent"
+                android:textSize="13sp"
+                android:fontFamily="monospace"
+                android:gravity="center"
+                android:padding="16dp"/>
+        </com.google.android.material.card.MaterialCardView>
+
+        <!-- Main body text -->
+        <com.google.android.material.card.MaterialCardView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            style="@style/Widget.NeuralNet.Card"
+            android:layout_marginBottom="16dp">
+
+            <TextView
+                android:id="@+id/pageBody"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Page body"
+                android:textColor="@color/text_secondary"
+                android:textSize="15sp"
+                android:lineSpacingMultiplier="1.5"
+                android:padding="20dp"
+                android:fontFamily="monospace"/>
+        </com.google.android.material.card.MaterialCardView>
+
+        <!-- Tip card -->
+        <com.google.android.material.card.MaterialCardView
+            android:id="@+id/tipCard"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            style="@style/Widget.NeuralNet.Card"
+            android:visibility="gone">
+
+            <TextView
+                android:id="@+id/tipText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text=""
+                android:textColor="@color/brand_accent"
+                android:textSize="13sp"
+                android:lineSpacingMultiplier="1.4"
+                android:padding="16dp"/>
+        </com.google.android.material.card.MaterialCardView>
+
+        <View android:layout_width="match_parent" android:layout_height="20dp"/>
+
+    </LinearLayout>
+</ScrollView>
