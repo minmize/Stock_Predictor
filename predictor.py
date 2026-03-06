@@ -105,11 +105,12 @@ class StockPredictor:
         data_start = df.iloc[0]["date"].strftime("%Y-%m-%d")
         data_end = df.iloc[-1]["date"].strftime("%Y-%m-%d")
 
-        # Step 2: Get sentiment score
+        # Step 2: Get sentiment scores (50 articles each)
         sentiment_score = 0.0
+        world_sentiment = 0.0
         if self.use_sentiment:
             try:
-                news = self.fetcher.fetch_ticker_news(self.ticker, limit=20)
+                news = self.fetcher.fetch_ticker_news(self.ticker, limit=50)
                 sentiment_score = self.sentiment_evaluator.evaluate_sentiment(
                     self.ticker, news
                 )
@@ -119,11 +120,33 @@ class StockPredictor:
             except Exception as e:
                 logger.warning(f"Sentiment evaluation failed: {e}")
 
-        # Step 3: Build feature vector (with sector encoding)
+            try:
+                world_news = self.fetcher.fetch_market_news(limit=50)
+                world_sentiment = (
+                    self.sentiment_evaluator.evaluate_world_events(
+                        self.ticker, self.sector, world_news
+                    )
+                )
+                logger.info(
+                    f"World events sentiment: {world_sentiment}"
+                )
+            except Exception as e:
+                logger.warning(f"World events sentiment failed: {e}")
+
+        # Step 2b: Fetch fundamental data
+        fundamentals = {}
+        try:
+            fundamentals = self.fetcher.fetch_financials(self.ticker)
+        except Exception as e:
+            logger.warning(f"Fundamentals fetch failed: {e}")
+
+        # Step 3: Build feature vector (with all scalar features)
         feature_vector = build_feature_matrix(
             df, sentiment_score=sentiment_score,
             sector=self.sector,
-            lookback_days=config.TRAINING_WINDOW_DAYS
+            lookback_days=config.TRAINING_WINDOW_DAYS,
+            world_sentiment=world_sentiment,
+            fundamentals=fundamentals,
         )
 
         if feature_vector is None or len(feature_vector) == 0:
@@ -185,6 +208,8 @@ class StockPredictor:
             "current_price": round(current_price, 2),
             "predictions": predictions,
             "sentiment_score": round(sentiment_score, 3),
+            "world_sentiment": round(world_sentiment, 3),
+            "has_fundamentals": bool(fundamentals),
             "data_range": {
                 "start_date": data_start,
                 "end_date": data_end,
@@ -223,8 +248,16 @@ def format_prediction_report(result: dict) -> str:
     )
     lines.append(f"  Current price: ${result['current_price']:.2f}")
     lines.append(
-        f"  Sentiment score: {result['sentiment_score']:+.3f} "
+        f"  Ticker sentiment: {result['sentiment_score']:+.3f} "
         f"({'Positive' if result['sentiment_score'] > 0.1 else 'Negative' if result['sentiment_score'] < -0.1 else 'Neutral'})"
+    )
+    world_s = result.get("world_sentiment", 0.0)
+    lines.append(
+        f"  World sentiment:  {world_s:+.3f} "
+        f"({'Positive' if world_s > 0.1 else 'Negative' if world_s < -0.1 else 'Neutral'})"
+    )
+    lines.append(
+        f"  Fundamentals:     {'Available' if result.get('has_fundamentals') else 'Not available'}"
     )
     lines.append("")
     lines.append("  Predictions:")

@@ -5,7 +5,7 @@ Takes raw OHLCV data and produces feature vectors for the neural network.
 Each data point in the input window is turned into features, and the
 neural network input layer is automatically sized to match.
 
-Features computed per day (27 indicators):
+Features computed per day (27 technical indicators):
 - Daily returns (close-to-close % change, log returns)
 - Intraday range (high - low) / close
 - Gap (open vs previous close)
@@ -25,8 +25,12 @@ Features computed per day (27 indicators):
 - On-Balance Volume ratio
 - Money Flow Index (14-day)
 - Chaikin Money Flow (20-day)
+
+Scalar features appended to the flattened window (13 values):
 - Sector value (normalized index into standard sector array, 0 to 1)
-- Sentiment score (from Anthropic API)
+- Ticker sentiment score (from Anthropic API, 50 news articles)
+- World events sentiment score (macro/geopolitical, 50 articles)
+- 10 fundamental metrics (EPS, revenue growth, margins, ratios)
 """
 
 import logging
@@ -185,6 +189,33 @@ FEATURE_COLUMNS = [
 ]
 
 
+# Ordered keys for fundamental metrics (must match data_fetcher output)
+FUNDAMENTAL_KEYS = [
+    "eps", "revenue_growth", "profit_margin", "debt_to_equity",
+    "current_ratio", "roe", "operating_margin",
+    "free_cash_flow_margin", "asset_turnover", "payout_ratio",
+]
+
+
+def normalize_fundamentals(fundamentals: dict) -> np.ndarray:
+    """
+    Convert a fundamentals dict into a normalized numpy array.
+
+    Applies soft clipping via tanh to keep values in [-1, 1].
+
+    Args:
+        fundamentals: Dict from MassiveDataFetcher.fetch_financials()
+
+    Returns:
+        1D numpy array of length len(FUNDAMENTAL_KEYS)
+    """
+    values = []
+    for key in FUNDAMENTAL_KEYS:
+        raw = fundamentals.get(key, 0.0)
+        values.append(np.tanh(float(raw)))
+    return np.array(values, dtype=np.float32)
+
+
 def encode_sector(sector: str) -> float:
     """
     Encode a sector as a single normalized value in [0, 1].
@@ -215,20 +246,23 @@ def encode_sector(sector: str) -> float:
 
 def build_feature_matrix(df: pd.DataFrame, sentiment_score: float = 0.0,
                           sector: str = "other",
-                          lookback_days: int = None) -> np.ndarray:
+                          lookback_days: int = None,
+                          world_sentiment: float = 0.0,
+                          fundamentals: dict = None) -> np.ndarray:
     """
     Build the full feature matrix from OHLCV data.
 
     Takes the last `lookback_days` of data, computes technical features,
-    and flattens into a single feature vector. Appends the normalized
-    sector value and sentiment score.
+    and flattens into a single feature vector. Appends scalar features:
+    sector, ticker sentiment, world events sentiment, and fundamentals.
 
     Args:
         df: DataFrame with OHLCV columns (and date)
-        sentiment_score: Sentiment value from Anthropic API [-1, 1]
+        sentiment_score: Ticker sentiment from Anthropic API [-1, 1]
         sector: Sector name for encoding
         lookback_days: Number of days to include in the feature window
-                       (default: TRAINING_WINDOW_DAYS from config)
+        world_sentiment: Macro/world events sentiment [-1, 1]
+        fundamentals: Dict of fundamental metrics from fetch_financials()
 
     Returns:
         1D numpy array: the feature vector for the neural network
@@ -254,12 +288,13 @@ def build_feature_matrix(df: pd.DataFrame, sentiment_score: float = 0.0,
     # Flatten the 2D matrix (days x features) into a 1D vector
     flat_features = feature_matrix.flatten()
 
-    # Append sector as a single normalized value [0, 1]
-    sector_value = encode_sector(sector)
-    flat_features = np.append(flat_features, sector_value)
-
-    # Append sentiment score at the end
+    # Append scalar features (order must match get_feature_count)
+    flat_features = np.append(flat_features, encode_sector(sector))
     flat_features = np.append(flat_features, sentiment_score)
+    flat_features = np.append(flat_features, world_sentiment)
+    flat_features = np.append(
+        flat_features, normalize_fundamentals(fundamentals or {})
+    )
 
     return flat_features.astype(np.float32)
 
@@ -299,7 +334,12 @@ def get_feature_count(lookback_days: int = None) -> int:
     """
     Calculate the total number of input features.
 
-    This equals (lookback_days * len(FEATURE_COLUMNS)) + 1 (sector) + 1 (sentiment).
+    This equals:
+        (lookback_days * len(FEATURE_COLUMNS))
+        + 1  (sector)
+        + 1  (ticker sentiment)
+        + 1  (world events sentiment)
+        + len(FUNDAMENTAL_KEYS)  (fundamental metrics)
 
     Args:
         lookback_days: Number of lookback days
@@ -309,5 +349,7 @@ def get_feature_count(lookback_days: int = None) -> int:
     """
     lookback_days = lookback_days or config.TRAINING_WINDOW_DAYS
     return (lookback_days * len(FEATURE_COLUMNS)
-            + 1   # sector (single normalized value)
-            + 1)  # sentiment
+            + 1   # sector
+            + 1   # ticker sentiment
+            + 1   # world events sentiment
+            + len(FUNDAMENTAL_KEYS))  # fundamental metrics

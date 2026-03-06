@@ -64,6 +64,33 @@ Consider:
 
 Return ONLY the number, nothing else. Example: 0.35"""
 
+WORLD_EVENTS_SYSTEM_PROMPT = """You are a macroeconomic and geopolitical analyst.
+You will be given a set of recent general market and world news headlines.
+
+Your task is to assess how these world events are likely to impact the stock
+market overall, considering the specific stock ticker mentioned.
+
+Return ONLY a single floating point number between -1.0 and 1.0 where:
+
+-1.0 = Extremely negative macro environment (war escalation, global recession,
+       financial crisis, pandemic, trade war escalation)
+-0.5 = Moderately negative (rate hikes, geopolitical tensions, inflation concerns)
+-0.2 = Slightly negative (minor regulatory concerns, mild economic slowdown)
+ 0.0 = Neutral (mixed signals, business as usual)
+ 0.2 = Slightly positive (stable growth, minor policy tailwinds)
+ 0.5 = Moderately positive (rate cuts, peace progress, strong economic data)
+ 1.0 = Extremely positive (major peace deals, economic boom, breakthrough policy)
+
+Focus on:
+- Geopolitical events (wars, sanctions, trade agreements)
+- Monetary policy (Fed decisions, interest rates, quantitative easing/tightening)
+- Economic indicators (GDP, unemployment, inflation data)
+- Global supply chain disruptions
+- Regulatory changes affecting markets
+- How these events specifically relate to the given stock's sector
+
+Return ONLY the number, nothing else. Example: -0.25"""
+
 
 class SentimentEvaluator:
     """Evaluates market sentiment using Anthropic Claude API."""
@@ -174,6 +201,65 @@ class SentimentEvaluator:
             return 0.0
         except anthropic.APIError as e:
             logger.error(f"Anthropic API error for {ticker}: {e}")
+            return 0.0
+
+    def evaluate_world_events(self, ticker: str, sector: str,
+                              news_articles: list[dict]) -> float:
+        """
+        Analyze general market / world news for macro sentiment impact
+        on a specific stock.
+
+        Args:
+            ticker: Stock ticker symbol (for context)
+            sector: Sector of the stock (for relevance weighting)
+            news_articles: List of dicts with 'title' and 'description' keys
+                           (general market news, not ticker-specific)
+
+        Returns:
+            Float between -1.0 and 1.0 representing macro sentiment
+        """
+        if not news_articles:
+            logger.info("No world news articles, returning neutral 0.0")
+            return 0.0
+
+        if len(news_articles) > 50:
+            news_articles = news_articles[:50]
+
+        news_text = (
+            f"Stock: {ticker}\nSector: {sector}\n\n"
+            f"Recent World/Market News:\n\n"
+        )
+        for i, article in enumerate(news_articles, 1):
+            title = article.get("title", "No title")
+            desc = article.get("description", "No description")
+            date = article.get("published_utc", "Unknown date")
+            news_text += f"{i}. [{date}] {title}\n   {desc}\n\n"
+
+        try:
+            message = self.client.messages.create(
+                model=self.model,
+                max_tokens=20,
+                system=WORLD_EVENTS_SYSTEM_PROMPT,
+                messages=[{
+                    "role": "user",
+                    "content": news_text,
+                }],
+            )
+            raw_score = message.content[0].text.strip()
+            score = float(raw_score)
+            score = max(-1.0, min(1.0, score))
+            logger.info(
+                f"World events sentiment for {ticker}: {score}"
+            )
+            return score
+
+        except (ValueError, IndexError) as e:
+            logger.warning(
+                f"Could not parse world events score: {e}. Returning neutral."
+            )
+            return 0.0
+        except anthropic.APIError as e:
+            logger.error(f"Anthropic API error for world events: {e}")
             return 0.0
 
     def evaluate_sentiment_from_text(self, ticker: str,

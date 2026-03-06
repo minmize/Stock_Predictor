@@ -36,7 +36,9 @@ from sentiment import SentimentEvaluator
 from features import (
     compute_targets,
     encode_sector,
+    normalize_fundamentals,
     FEATURE_COLUMNS,
+    FUNDAMENTAL_KEYS,
     compute_technical_features,
 )
 from neural_net import ModelManager
@@ -304,7 +306,9 @@ class StockTrainer:
         # and cross-run persistence
         feature_names = FEATURE_COLUMNS.copy()
         feature_names.append("sector")
-        feature_names.append("sentiment")
+        feature_names.append("ticker_sentiment")
+        feature_names.append("world_sentiment")
+        feature_names.extend(FUNDAMENTAL_KEYS)
         self.model_manager.save_model(
             self.model, feature_names, training_info,
             optimizer=self.optimizer
@@ -434,20 +438,32 @@ class StockTrainer:
 
         # ----------------------------------------------------------
         # Initialize model + optimizer ONCE before all batches.
-        # This ensures:
-        #   - Adam optimizer momentum carries across batches
-        #   - Learning rate scheduler persists (LR can decrease)
-        #   - No redundant disk I/O between batches
-        #   - Optimizer state from prior runs is restored
+        # Input = (window * technical_features) + sector + ticker_sentiment
+        #         + world_sentiment + fundamental_metrics
         # ----------------------------------------------------------
-        input_size = (window * len(FEATURE_COLUMNS)) + 1 + 1  # features + sector + sentiment
+        input_size = (
+            (window * len(FEATURE_COLUMNS))
+            + 1   # sector
+            + 1   # ticker sentiment
+            + 1   # world events sentiment
+            + len(FUNDAMENTAL_KEYS)  # fundamental metrics
+        )
         self._init_model_and_optimizer(input_size)
 
-        # Get sentiment once for the entire run
+        # Fetch fundamental data once for the entire run
+        fundamentals = {}
+        try:
+            fundamentals = self.fetcher.fetch_financials(self.ticker)
+        except Exception as e:
+            logger.warning(f"Fundamentals fetch failed: {e}")
+        fundamental_values = normalize_fundamentals(fundamentals)
+
+        # Get sentiment once for the entire run (50 articles)
         sentiment_score = 0.0
+        world_sentiment_score = 0.0
         if self.use_sentiment:
             try:
-                news = self.fetcher.fetch_ticker_news(self.ticker, limit=20)
+                news = self.fetcher.fetch_ticker_news(self.ticker, limit=50)
                 sentiment_score = self.sentiment_evaluator.evaluate_sentiment(
                     self.ticker, news
                 )
@@ -456,6 +472,21 @@ class StockTrainer:
                 )
             except Exception as e:
                 logger.warning(f"Sentiment evaluation failed: {e}")
+
+            # World events / macro sentiment
+            try:
+                world_news = self.fetcher.fetch_market_news(limit=50)
+                world_sentiment_score = (
+                    self.sentiment_evaluator.evaluate_world_events(
+                        self.ticker, self.sector, world_news
+                    )
+                )
+                logger.info(
+                    f"World events sentiment for {self.ticker}: "
+                    f"{world_sentiment_score}"
+                )
+            except Exception as e:
+                logger.warning(f"World events sentiment failed: {e}")
 
         # Pre-compute values used for all batches
         sector_value = encode_sector(self.sector)
@@ -514,6 +545,8 @@ class StockTrainer:
                 flat = window_data.flatten()
                 flat = np.append(flat, sector_value)
                 flat = np.append(flat, sentiment_score)
+                flat = np.append(flat, world_sentiment_score)
+                flat = np.append(flat, fundamental_values)
 
                 # Forward-looking targets
                 target = compute_targets(feat_df, i)
