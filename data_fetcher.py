@@ -288,13 +288,13 @@ class MassiveDataFetcher:
         from_date = (datetime.now() - timedelta(days=months * 31)).strftime("%Y-%m-%d")
         return self.fetch_rest_aggregates(ticker, from_date, to_date)
 
-    def fetch_ticker_news(self, ticker: str, limit: int = 20) -> list[dict]:
+    def fetch_ticker_news(self, ticker: str, limit: int = 50) -> list[dict]:
         """
         Fetch recent news articles for a ticker via REST API.
 
         Args:
             ticker: Stock ticker symbol
-            limit: Max number of articles
+            limit: Max number of articles (default: 50)
 
         Returns:
             List of dicts with keys: title, description, published_utc, url
@@ -313,6 +313,174 @@ class MassiveDataFetcher:
 
         logger.info(f"REST: Got {len(articles)} news articles for {ticker}")
         return articles
+
+    def fetch_market_news(self, limit: int = 50) -> list[dict]:
+        """
+        Fetch general market / world news (not ticker-specific).
+
+        Uses broad market tickers (SPY, QQQ, DIA) to pull macro-level
+        headlines that capture world events affecting markets.
+
+        Args:
+            limit: Max number of articles (default: 50)
+
+        Returns:
+            List of dicts with keys: title, description, published_utc, url
+        """
+        logger.info("REST: Fetching general market news")
+        articles = []
+        for broad_ticker in ["SPY", "QQQ", "DIA"]:
+            try:
+                for article in self.rest_client.list_ticker_news(
+                    broad_ticker, limit=limit // 3,
+                    sort="published_utc", order="desc"
+                ):
+                    articles.append({
+                        "title": article.title,
+                        "description": getattr(article, "description", ""),
+                        "published_utc": article.published_utc,
+                        "article_url": article.article_url,
+                    })
+            except Exception as e:
+                logger.warning(f"Could not fetch news for {broad_ticker}: {e}")
+
+        # Deduplicate by title
+        seen_titles = set()
+        unique_articles = []
+        for article in articles:
+            if article["title"] not in seen_titles:
+                seen_titles.add(article["title"])
+                unique_articles.append(article)
+
+        logger.info(
+            f"REST: Got {len(unique_articles)} general market news articles"
+        )
+        return unique_articles[:limit]
+
+    def fetch_financials(self, ticker: str) -> dict:
+        """
+        Fetch the most recent financial data for a ticker via
+        Polygon's Stock Financials (vX) endpoint.
+
+        Extracts key fundamental metrics from the income statement,
+        balance sheet, and cash flow statement.
+
+        Args:
+            ticker: Stock ticker symbol (e.g. "AAPL")
+
+        Returns:
+            Dict of normalized fundamental metrics. Keys:
+            - eps: Earnings per share (diluted)
+            - revenue_growth: Quarter-over-quarter revenue growth
+            - profit_margin: Net income / revenue
+            - debt_to_equity: Total liabilities / equity
+            - current_ratio: Current assets / current liabilities
+            - roe: Return on equity
+            - operating_margin: Operating income / revenue
+            - free_cash_flow_margin: Free cash flow / revenue
+            - asset_turnover: Revenue / total assets
+            - payout_ratio: Dividends / net income
+            Returns empty dict on failure.
+        """
+        logger.info(f"REST: Fetching financials for {ticker}")
+
+        try:
+            financials_iter = self.rest_client.vx.list_stock_financials(
+                ticker=ticker, limit=2, sort="period_of_report_date",
+                order="desc", timeframe="quarterly"
+            )
+            financials_list = list(financials_iter)
+
+            if not financials_list:
+                logger.warning(f"No financial data for {ticker}")
+                return {}
+
+            latest = financials_list[0]
+            prior = financials_list[1] if len(financials_list) > 1 else None
+
+            result = {}
+
+            # Extract from financials object
+            fin = getattr(latest, "financials", {})
+            income = fin.get("income_statement", {}) if isinstance(fin, dict) else {}
+            balance = fin.get("balance_sheet", {}) if isinstance(fin, dict) else {}
+            cash_flow = (
+                fin.get("cash_flow_statement", {}) if isinstance(fin, dict) else {}
+            )
+
+            def _val(section, key):
+                """Safely extract a numeric value from a financials section."""
+                item = section.get(key, {})
+                if isinstance(item, dict):
+                    return item.get("value", 0.0)
+                return 0.0
+
+            revenue = _val(income, "revenues") or 1e-10
+            net_income = _val(income, "net_income_loss")
+            operating_income = _val(income, "operating_income_loss")
+            eps_diluted = _val(income, "diluted_earnings_per_share")
+
+            total_assets = _val(balance, "assets") or 1e-10
+            total_liabilities = _val(balance, "liabilities")
+            equity = _val(balance, "equity") or 1e-10
+            current_assets = _val(balance, "current_assets") or 1e-10
+            current_liabilities = (
+                _val(balance, "current_liabilities") or 1e-10
+            )
+
+            operating_cf = _val(
+                cash_flow, "net_cash_flow_from_operating_activities"
+            )
+            capex = abs(
+                _val(cash_flow, "net_cash_flow_from_investing_activities")
+            )
+            dividends = abs(
+                _val(cash_flow, "net_cash_flow_from_financing_activities")
+            )
+
+            # Compute metrics
+            result["eps"] = float(eps_diluted)
+            result["profit_margin"] = float(net_income / revenue)
+            result["operating_margin"] = float(operating_income / revenue)
+            result["debt_to_equity"] = float(total_liabilities / equity)
+            result["current_ratio"] = float(current_assets / current_liabilities)
+            result["roe"] = float(net_income / equity)
+            result["asset_turnover"] = float(revenue / total_assets)
+            result["free_cash_flow_margin"] = float(
+                (operating_cf - capex) / revenue
+            )
+            result["payout_ratio"] = float(
+                dividends / (abs(net_income) + 1e-10)
+            )
+
+            # Revenue growth (quarter over quarter)
+            if prior:
+                prior_fin = getattr(prior, "financials", {})
+                prior_income = (
+                    prior_fin.get("income_statement", {})
+                    if isinstance(prior_fin, dict) else {}
+                )
+                prior_revenue = _val(prior_income, "revenues") or 1e-10
+                result["revenue_growth"] = float(
+                    (revenue - prior_revenue) / abs(prior_revenue)
+                )
+            else:
+                result["revenue_growth"] = 0.0
+
+            logger.info(
+                f"Financials for {ticker}: "
+                f"EPS={result['eps']:.2f}, "
+                f"margin={result['profit_margin']:.2%}, "
+                f"D/E={result['debt_to_equity']:.2f}"
+            )
+            return result
+
+        except Exception as e:
+            logger.warning(
+                f"Could not fetch financials for {ticker}: {e}. "
+                f"Using zeros."
+            )
+            return {}
 
 
 def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:

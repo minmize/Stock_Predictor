@@ -37,7 +37,12 @@ SECTORS = [
 # Neural Network Defaults
 # ============================================================
 # Hidden layer sizes (adjustable)
-HIDDEN_LAYERS = [200, 100, 30]
+# Sized for ~1714 input features: gradual compression from input to output.
+# Layer 1 (512): compresses 1714 inputs ~3.3:1, captures broad patterns
+# Layer 2 (256): intermediate representation
+# Layer 3 (128): higher-level abstractions
+# Layer 4 (32):  compact representation before 6 output nodes
+HIDDEN_LAYERS = [512, 256, 128, 32]
 
 # Output timeframes in trading days
 # 1 day, 4 days, 1 week (5), 2 weeks (10), 1 month (21), 3 months (63)
