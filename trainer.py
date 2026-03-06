@@ -173,8 +173,15 @@ class StockTrainer:
                     for k, v in state.items():
                         if isinstance(v, torch.Tensor):
                             state[k] = v.to(self.device)
+                # Reset LR to configured base value. The saved LR may have
+                # been reduced by overshoot detection at the end of a previous
+                # session; keeping that stale reduced LR would make the network
+                # learn far too slowly from the start of a new run.
+                for param_group in self.optimizer.param_groups:
+                    param_group["lr"] = learning_rate
                 logger.info(
-                    "Restored optimizer state from previous training run"
+                    "Restored optimizer state from previous training run "
+                    f"(LR reset to {learning_rate})"
                 )
             except (ValueError, KeyError) as e:
                 logger.warning(
@@ -182,9 +189,10 @@ class StockTrainer:
                     f"may have changed): {e}. Starting fresh optimizer."
                 )
 
-        # NOTE: scheduler is created fresh inside each train_batch call
-        # so that patience does not accumulate across batches and the LR
-        # is not permanently driven to zero over a long training run.
+        # NOTE: LR management (overshoot detection + reduction) is handled
+        # inside each train_batch call via consecutive_bad epoch counting.
+        # The saved optimizer LR is always reset to the base value above so
+        # each run starts at the configured rate, not a stale reduced value.
 
         logger.info(
             f"Model ready: {sum(p.numel() for p in self.model.parameters())} "
@@ -276,10 +284,20 @@ class StockTrainer:
         # Learning rate is set proportionally to RMSE after each epoch:
         #   lr = clamp(LR_SCALE × RMSE, MIN_LR, MAX_LR)
         # High loss → high LR; as the model improves LR decays automatically.
+        # Overshoot-recovery parameters.
+        # When val_loss has risen for _OVERSHOOT_PATIENCE consecutive epochs
+        # the model has passed the optimum.  We restore the last best weights,
+        # dampen Adam's first moment (exp_avg) so the accumulated momentum
+        # that carried us past the optimum can't push us past it again, then
+        # halve the LR so subsequent steps are smaller.
+        _OVERSHOOT_PATIENCE = 5    # epochs of rising val_loss before acting
+        _LR_DECAY_FACTOR    = 0.5  # LR multiplier on each detected overshoot
+        _MIN_LR             = 1e-6  # hard floor
 
         history = {"train_loss": [], "val_loss": []}
-        best_val_loss = float("inf")
-        best_model_state = None          # snapshot at best validation epoch
+        best_val_loss    = float("inf")
+        best_model_state = None   # snapshot at best validation epoch
+        consecutive_bad  = 0      # epochs since last val_loss improvement
 
         for epoch in range(epochs):
             # --- Training pass ---
@@ -328,13 +346,41 @@ class StockTrainer:
             history["train_loss"].append(avg_train_loss)
             history["val_loss"].append(val_loss)
 
-            # Snapshot weights at best validation epoch
+            # Overshoot recovery ─────────────────────────────────────────────
+            # On improvement: snapshot weights and reset the bad-epoch counter.
+            # On sustained divergence: restore the best-known weights so we
+            # step back to the pre-overshoot point, then dampen Adam's first
+            # moment (exp_avg) so the momentum that pushed us past the optimum
+            # can't repeat the error, and reduce the LR so the next approach
+            # to the optimum is made with smaller steps.
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 best_model_state = {
                     k: v.clone()
                     for k, v in self.model.state_dict().items()
                 }
+                consecutive_bad = 0
+            else:
+                consecutive_bad += 1
+                if consecutive_bad >= _OVERSHOOT_PATIENCE \
+                        and best_model_state is not None:
+                    # Step back to the last known-good weights
+                    self.model.load_state_dict(best_model_state)
+                    # Dampen first moment so accumulated momentum can't push
+                    # past the optimum again on the next forward pass
+                    for state in self.optimizer.state.values():
+                        if isinstance(state, dict) and "exp_avg" in state:
+                            state["exp_avg"].mul_(0.1)
+                    # Reduce LR (floor at _MIN_LR)
+                    for pg in self.optimizer.param_groups:
+                        pg["lr"] = max(pg["lr"] * _LR_DECAY_FACTOR, _MIN_LR)
+                    logger.info(
+                        f"Epoch {epoch + 1}: overshoot detected — restored "
+                        f"best weights, dampened momentum, "
+                        f"LR → {self.optimizer.param_groups[0]['lr']:.2e}"
+                    )
+                    consecutive_bad = 0
+            # ────────────────────────────────────────────────────────────────
 
             if (epoch + 1) % 10 == 0 or epoch == 0:
                 current_lr = self.optimizer.param_groups[0]["lr"]
