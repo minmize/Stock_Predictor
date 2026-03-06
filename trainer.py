@@ -273,14 +273,9 @@ class StockTrainer:
                 return criterion(pred_price, actual_price)
             return criterion(preds, tgts)
 
-        # Fresh scheduler per batch: prevents the patience counter from
-        # accumulating across all batches and driving the LR to zero.
-        # min_lr guards against the floor being reached and training
-        # stalling completely.
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode="min", factor=0.5, patience=10,
-            min_lr=1e-5
-        )
+        # Learning rate is set proportionally to RMSE after each epoch:
+        #   lr = clamp(LR_SCALE × RMSE, MIN_LR, MAX_LR)
+        # High loss → high LR; as the model improves LR decays automatically.
 
         history = {"train_loss": [], "val_loss": []}
         best_val_loss = float("inf")
@@ -324,8 +319,11 @@ class StockTrainer:
                     c_val if use_price_loss else None
                 ).item()
 
-            # Scheduler is local to this batch — no cross-batch LR decay
-            scheduler.step(val_loss)
+            # Proportional LR: RMSE (in price units) drives the learning rate
+            rmse = val_loss ** 0.5
+            new_lr = max(config.MIN_LR, min(config.MAX_LR, config.LR_SCALE * rmse))
+            for pg in self.optimizer.param_groups:
+                pg["lr"] = new_lr
 
             history["train_loss"].append(avg_train_loss)
             history["val_loss"].append(val_loss)
