@@ -46,27 +46,24 @@ def validate_api_keys(mode: str, use_sentiment: bool):
     """Check that required API keys are configured."""
     errors = []
 
-    if config.MASSIVE_API_KEY == "YOUR_MASSIVE_API_KEY_HERE":
+    if not config.MASSIVE_API_KEY:
         errors.append(
-            "MASSIVE_API_KEY not set in config.py "
-            "(required for REST API data fetching)"
+            "MASSIVE_API_KEY is not set "
+            "(required for REST API data fetching)\n"
+            "    export MASSIVE_API_KEY='your-key'"
         )
 
-    if use_sentiment:
-        if config.ANTHROPIC_API_KEY == "YOUR_ANTHROPIC_API_KEY_HERE":
-            errors.append(
-                "ANTHROPIC_API_KEY not set in config.py "
-                "(required for sentiment analysis, or use --no-sentiment)"
-            )
+    if use_sentiment and not config.ANTHROPIC_API_KEY:
+        errors.append(
+            "ANTHROPIC_API_KEY is not set "
+            "(required for sentiment analysis, or use --no-sentiment)\n"
+            "    export ANTHROPIC_API_KEY='your-key'"
+        )
 
     if errors:
-        print("\nConfiguration errors:")
+        print("\nMissing API key(s):")
         for e in errors:
             print(f"  - {e}")
-        print(
-            "\nPlease edit config.py and fill in your API keys.\n"
-            "See README or config.py comments for details."
-        )
         sys.exit(1)
 
 
