@@ -7,8 +7,8 @@ Training process:
 3. Fetches ALL price data in one REST call (with buffers for indicator
    warm-up at the start and forward targets at the end)
 4. Computes technical features once on the full dataset
-5. Every 3 batches, refreshes time-appropriate context:
-   a. Fundamental data filed before the batch end date (no leakage)
+5. For every batch, fetches fundamental data filed before the batch
+   end date (no leakage). Every 3 batches, also refreshes:
    b. Ticker sentiment from 10 historical news articles
    c. World events sentiment from 10 historical market articles
 6. For each 3-month batch:
@@ -482,22 +482,28 @@ class StockTrainer:
             )
 
             # -------------------------------------------------------
-            # Refresh sentiment & fundamentals every 3 batches using
-            # data available AS OF the batch end date (no leakage).
-            # Training uses 10 articles per sentiment call.
+            # Fundamentals: fetch every batch using filings available
+            # AS OF the batch end date (no leakage).
+            # -------------------------------------------------------
+            try:
+                fundamentals = self.fetcher.fetch_financials(
+                    self.ticker, as_of_date=end_str
+                )
+                fundamental_values = normalize_fundamentals(fundamentals)
+                logger.info(
+                    f"Fetched fundamentals for {self.ticker} as of {end_str}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Fundamentals fetch for {end_str} failed: {e}"
+                )
+
+            # -------------------------------------------------------
+            # Sentiment: refresh every N batches (Claude API calls are
+            # expensive). Uses historical news published before batch
+            # end date to avoid data leakage.
             # -------------------------------------------------------
             if (batch_num - 1) % _SENTIMENT_REFRESH_INTERVAL == 0:
-                # Fundamentals: only filings filed before batch end
-                try:
-                    fundamentals = self.fetcher.fetch_financials(
-                        self.ticker, as_of_date=end_str
-                    )
-                    fundamental_values = normalize_fundamentals(fundamentals)
-                except Exception as e:
-                    logger.warning(
-                        f"Fundamentals fetch for {end_str} failed: {e}"
-                    )
-
                 if self.use_sentiment:
                     # Ticker news published before batch end
                     try:
@@ -540,7 +546,7 @@ class StockTrainer:
                         )
 
                 logger.info(
-                    f"Refreshed context for batch {batch_num}: "
+                    f"Refreshed sentiment for batch {batch_num}: "
                     f"sentiment={sentiment_score:.3f}, "
                     f"world={world_sentiment_score:.3f}"
                 )
