@@ -310,9 +310,110 @@ class MassiveDataFetcher:
                 "published_utc": article.published_utc,
                 "article_url": article.article_url,
             })
+            if len(articles) >= limit:
+                break
 
         logger.info(f"REST: Got {len(articles)} news articles for {ticker}")
         return articles
+
+    def fetch_ticker_news_historical(self, ticker: str,
+                                      before_date: str,
+                                      limit: int = 10) -> list[dict]:
+        """
+        Fetch news articles for a ticker published before a given date.
+
+        Used during training to get news that was available at a
+        historical point in time (prevents data leakage).
+
+        Args:
+            ticker: Stock ticker symbol
+            before_date: "YYYY-MM-DD" — only articles published on or before
+            limit: Max number of articles (default: 10 for training)
+
+        Returns:
+            List of dicts with keys: title, description, published_utc, url
+        """
+        logger.info(
+            f"REST: Fetching historical news for {ticker} before {before_date}"
+        )
+        articles = []
+        try:
+            for article in self.rest_client.list_ticker_news(
+                ticker, limit=limit, sort="published_utc", order="desc",
+                published_utc_lte=f"{before_date}T23:59:59Z"
+            ):
+                articles.append({
+                    "title": article.title,
+                    "description": getattr(article, "description", ""),
+                    "published_utc": article.published_utc,
+                    "article_url": article.article_url,
+                })
+                if len(articles) >= limit:
+                    break
+        except Exception as e:
+            logger.warning(
+                f"Could not fetch historical news for {ticker}: {e}"
+            )
+
+        logger.info(
+            f"REST: Got {len(articles)} historical news articles for {ticker}"
+        )
+        return articles
+
+    def fetch_market_news_historical(self, before_date: str,
+                                      limit: int = 10) -> list[dict]:
+        """
+        Fetch general market news published before a given date.
+
+        Used during training for world events sentiment at a historical
+        point in time.
+
+        Args:
+            before_date: "YYYY-MM-DD" — only articles published on or before
+            limit: Max number of articles (default: 10 for training)
+
+        Returns:
+            List of dicts with keys: title, description, published_utc, url
+        """
+        logger.info(
+            f"REST: Fetching historical market news before {before_date}"
+        )
+        articles = []
+        per_ticker_limit = max(limit // 3, 1)
+        for broad_ticker in ["SPY", "QQQ", "DIA"]:
+            count = 0
+            try:
+                for article in self.rest_client.list_ticker_news(
+                    broad_ticker, limit=per_ticker_limit,
+                    sort="published_utc", order="desc",
+                    published_utc_lte=f"{before_date}T23:59:59Z"
+                ):
+                    articles.append({
+                        "title": article.title,
+                        "description": getattr(article, "description", ""),
+                        "published_utc": article.published_utc,
+                        "article_url": article.article_url,
+                    })
+                    count += 1
+                    if count >= per_ticker_limit:
+                        break
+            except Exception as e:
+                logger.warning(
+                    f"Could not fetch historical news for {broad_ticker}: {e}"
+                )
+
+        # Deduplicate by title
+        seen_titles = set()
+        unique_articles = []
+        for article in articles:
+            if article["title"] not in seen_titles:
+                seen_titles.add(article["title"])
+                unique_articles.append(article)
+
+        logger.info(
+            f"REST: Got {len(unique_articles)} historical market news articles"
+        )
+        return unique_articles[:limit]
 
     def fetch_market_news(self, limit: int = 50) -> list[dict]:
         """
@@ -329,10 +430,12 @@ class MassiveDataFetcher:
         """
         logger.info("REST: Fetching general market news")
         articles = []
+        per_ticker_limit = max(limit // 3, 1)
         for broad_ticker in ["SPY", "QQQ", "DIA"]:
+            count = 0
             try:
                 for article in self.rest_client.list_ticker_news(
-                    broad_ticker, limit=limit // 3,
+                    broad_ticker, limit=per_ticker_limit,
                     sort="published_utc", order="desc"
                 ):
                     articles.append({
@@ -341,6 +444,9 @@ class MassiveDataFetcher:
                         "published_utc": article.published_utc,
                         "article_url": article.article_url,
                     })
+                    count += 1
+                    if count >= per_ticker_limit:
+                        break
             except Exception as e:
                 logger.warning(f"Could not fetch news for {broad_ticker}: {e}")
 
@@ -357,37 +463,44 @@ class MassiveDataFetcher:
         )
         return unique_articles[:limit]
 
-    def fetch_financials(self, ticker: str) -> dict:
+    def fetch_financials(self, ticker: str,
+                         as_of_date: str = None) -> dict:
         """
         Fetch the most recent financial data for a ticker via
         Polygon's Stock Financials (vX) endpoint.
 
-        Extracts key fundamental metrics from the income statement,
-        balance sheet, and cash flow statement.
+        For training: pass as_of_date to get financials that were
+        actually available at that point in time (filed before that date).
+        For prediction: omit as_of_date to get the latest filings.
 
         Args:
             ticker: Stock ticker symbol (e.g. "AAPL")
+            as_of_date: "YYYY-MM-DD" — only return filings filed on or
+                        before this date (prevents data leakage in training)
 
         Returns:
-            Dict of normalized fundamental metrics. Keys:
-            - eps: Earnings per share (diluted)
-            - revenue_growth: Quarter-over-quarter revenue growth
-            - profit_margin: Net income / revenue
-            - debt_to_equity: Total liabilities / equity
-            - current_ratio: Current assets / current liabilities
-            - roe: Return on equity
-            - operating_margin: Operating income / revenue
-            - free_cash_flow_margin: Free cash flow / revenue
-            - asset_turnover: Revenue / total assets
-            - payout_ratio: Dividends / net income
-            Returns empty dict on failure.
+            Dict of fundamental metrics. Returns empty dict on failure.
         """
-        logger.info(f"REST: Fetching financials for {ticker}")
+        if as_of_date:
+            logger.info(
+                f"REST: Fetching financials for {ticker} as of {as_of_date}"
+            )
+        else:
+            logger.info(f"REST: Fetching financials for {ticker} (latest)")
 
         try:
+            kwargs = {
+                "ticker": ticker,
+                "limit": 2,
+                "sort": "period_of_report_date",
+                "order": "desc",
+                "timeframe": "quarterly",
+            }
+            if as_of_date:
+                kwargs["filing_date_lte"] = as_of_date
+
             financials_iter = self.rest_client.vx.list_stock_financials(
-                ticker=ticker, limit=2, sort="period_of_report_date",
-                order="desc", timeframe="quarterly"
+                **kwargs
             )
             financials_list = list(financials_iter)
 
@@ -400,20 +513,31 @@ class MassiveDataFetcher:
 
             result = {}
 
-            # Extract from financials object
-            fin = getattr(latest, "financials", {})
-            income = fin.get("income_statement", {}) if isinstance(fin, dict) else {}
-            balance = fin.get("balance_sheet", {}) if isinstance(fin, dict) else {}
-            cash_flow = (
-                fin.get("cash_flow_statement", {}) if isinstance(fin, dict) else {}
-            )
+            # Extract from financials object.
+            # Polygon client returns namespace objects (not dicts), so we
+            # need getattr-based access at every level.
+            fin = getattr(latest, "financials", None) or {}
+
+            def _get(obj, key, default=None):
+                """Get a value from a dict or object attribute."""
+                if isinstance(obj, dict):
+                    return obj.get(key, default)
+                return getattr(obj, key, default)
+
+            income = _get(fin, "income_statement") or {}
+            balance = _get(fin, "balance_sheet") or {}
+            cash_flow = _get(fin, "cash_flow_statement") or {}
 
             def _val(section, key):
                 """Safely extract a numeric value from a financials section."""
-                item = section.get(key, {})
-                if isinstance(item, dict):
-                    return item.get("value", 0.0)
-                return 0.0
+                item = _get(section, key)
+                if item is None:
+                    return 0.0
+                if isinstance(item, (int, float)):
+                    return float(item)
+                # Polygon returns objects with a .value attribute
+                val = _get(item, "value", 0.0)
+                return float(val) if val is not None else 0.0
 
             revenue = _val(income, "revenues") or 1e-10
             net_income = _val(income, "net_income_loss")
@@ -455,11 +579,8 @@ class MassiveDataFetcher:
 
             # Revenue growth (quarter over quarter)
             if prior:
-                prior_fin = getattr(prior, "financials", {})
-                prior_income = (
-                    prior_fin.get("income_statement", {})
-                    if isinstance(prior_fin, dict) else {}
-                )
+                prior_fin = getattr(prior, "financials", None) or {}
+                prior_income = _get(prior_fin, "income_statement") or {}
                 prior_revenue = _val(prior_income, "revenues") or 1e-10
                 result["revenue_growth"] = float(
                     (revenue - prior_revenue) / abs(prior_revenue)
