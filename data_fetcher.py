@@ -310,6 +310,8 @@ class MassiveDataFetcher:
                 "published_utc": article.published_utc,
                 "article_url": article.article_url,
             })
+            if len(articles) >= limit:
+                break
 
         logger.info(f"REST: Got {len(articles)} news articles for {ticker}")
         return articles
@@ -346,6 +348,8 @@ class MassiveDataFetcher:
                     "published_utc": article.published_utc,
                     "article_url": article.article_url,
                 })
+                if len(articles) >= limit:
+                    break
         except Exception as e:
             logger.warning(
                 f"Could not fetch historical news for {ticker}: {e}"
@@ -375,10 +379,12 @@ class MassiveDataFetcher:
             f"REST: Fetching historical market news before {before_date}"
         )
         articles = []
+        per_ticker_limit = max(limit // 3, 1)
         for broad_ticker in ["SPY", "QQQ", "DIA"]:
+            count = 0
             try:
                 for article in self.rest_client.list_ticker_news(
-                    broad_ticker, limit=limit // 3,
+                    broad_ticker, limit=per_ticker_limit,
                     sort="published_utc", order="desc",
                     published_utc_lte=f"{before_date}T23:59:59Z"
                 ):
@@ -388,6 +394,9 @@ class MassiveDataFetcher:
                         "published_utc": article.published_utc,
                         "article_url": article.article_url,
                     })
+                    count += 1
+                    if count >= per_ticker_limit:
+                        break
             except Exception as e:
                 logger.warning(
                     f"Could not fetch historical news for {broad_ticker}: {e}"
@@ -421,10 +430,12 @@ class MassiveDataFetcher:
         """
         logger.info("REST: Fetching general market news")
         articles = []
+        per_ticker_limit = max(limit // 3, 1)
         for broad_ticker in ["SPY", "QQQ", "DIA"]:
+            count = 0
             try:
                 for article in self.rest_client.list_ticker_news(
-                    broad_ticker, limit=limit // 3,
+                    broad_ticker, limit=per_ticker_limit,
                     sort="published_utc", order="desc"
                 ):
                     articles.append({
@@ -433,6 +444,9 @@ class MassiveDataFetcher:
                         "published_utc": article.published_utc,
                         "article_url": article.article_url,
                     })
+                    count += 1
+                    if count >= per_ticker_limit:
+                        break
             except Exception as e:
                 logger.warning(f"Could not fetch news for {broad_ticker}: {e}")
 
@@ -499,20 +513,31 @@ class MassiveDataFetcher:
 
             result = {}
 
-            # Extract from financials object
-            fin = getattr(latest, "financials", {})
-            income = fin.get("income_statement", {}) if isinstance(fin, dict) else {}
-            balance = fin.get("balance_sheet", {}) if isinstance(fin, dict) else {}
-            cash_flow = (
-                fin.get("cash_flow_statement", {}) if isinstance(fin, dict) else {}
-            )
+            # Extract from financials object.
+            # Polygon client returns namespace objects (not dicts), so we
+            # need getattr-based access at every level.
+            fin = getattr(latest, "financials", None) or {}
+
+            def _get(obj, key, default=None):
+                """Get a value from a dict or object attribute."""
+                if isinstance(obj, dict):
+                    return obj.get(key, default)
+                return getattr(obj, key, default)
+
+            income = _get(fin, "income_statement") or {}
+            balance = _get(fin, "balance_sheet") or {}
+            cash_flow = _get(fin, "cash_flow_statement") or {}
 
             def _val(section, key):
                 """Safely extract a numeric value from a financials section."""
-                item = section.get(key, {})
-                if isinstance(item, dict):
-                    return item.get("value", 0.0)
-                return 0.0
+                item = _get(section, key)
+                if item is None:
+                    return 0.0
+                if isinstance(item, (int, float)):
+                    return float(item)
+                # Polygon returns objects with a .value attribute
+                val = _get(item, "value", 0.0)
+                return float(val) if val is not None else 0.0
 
             revenue = _val(income, "revenues") or 1e-10
             net_income = _val(income, "net_income_loss")
@@ -554,11 +579,8 @@ class MassiveDataFetcher:
 
             # Revenue growth (quarter over quarter)
             if prior:
-                prior_fin = getattr(prior, "financials", {})
-                prior_income = (
-                    prior_fin.get("income_statement", {})
-                    if isinstance(prior_fin, dict) else {}
-                )
+                prior_fin = getattr(prior, "financials", None) or {}
+                prior_income = _get(prior_fin, "income_statement") or {}
                 prior_revenue = _val(prior_income, "revenues") or 1e-10
                 result["revenue_growth"] = float(
                     (revenue - prior_revenue) / abs(prior_revenue)
