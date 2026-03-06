@@ -182,10 +182,9 @@ class StockTrainer:
                     f"may have changed): {e}. Starting fresh optimizer."
                 )
 
-        # Persistent scheduler across batches
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode="min", factor=0.5, patience=10
-        )
+        # NOTE: scheduler is created fresh inside each train_batch call
+        # so that patience does not accumulate across batches and the LR
+        # is not permanently driven to zero over a long training run.
 
         logger.info(
             f"Model ready: {sum(p.numel() for p in self.model.parameters())} "
@@ -193,6 +192,7 @@ class StockTrainer:
         )
 
     def train_batch(self, features: np.ndarray, targets: np.ndarray,
+                    close_prices: np.ndarray = None,
                     epochs: int = None,
                     batch_size: int = None) -> dict:
         """
@@ -200,14 +200,28 @@ class StockTrainer:
 
         Uses self.model and self.optimizer which must be initialized
         by _init_model_and_optimizer() before calling this method.
-        The optimizer and its state persist across batch calls so that
-        Adam's momentum carries forward.
+        The optimizer state (Adam momentum / per-param LRs) persists
+        across batch calls; the LR scheduler is created fresh each
+        batch so its patience counter never accumulates across the
+        full training run.
+
+        Loss function: price-based MSE. For each sample the model's
+        predicted % change is converted back to an absolute price
+        (anchor_close × (1 + pred)) and compared to the actual future
+        close price (anchor_close × (1 + target)). This gives the
+        network a more natural, dollar-scale error signal.
+
+        Best-epoch checkpointing: the model state at the epoch with
+        the lowest validation loss is restored before saving so that
+        we never persist an overfitting checkpoint.
 
         Args:
-            features: Feature matrix (num_samples, input_size)
-            targets: Target matrix (num_samples, 6)
-            epochs: Number of training epochs
-            batch_size: Batch size
+            features:     Feature matrix  (num_samples, input_size)
+            targets:      Target matrix   (num_samples, 6)  — % change fractions
+            close_prices: Anchor-day close prices (num_samples,) for
+                          price-based loss. Falls back to plain MSE if None.
+            epochs:       Number of training epochs
+            batch_size:   Mini-batch size
 
         Returns:
             Dict with training statistics
@@ -217,36 +231,77 @@ class StockTrainer:
 
         self.model.train()
 
-        # Prepare data loaders
+        # Prepare tensors
         X_tensor = torch.FloatTensor(features).to(self.device)
         y_tensor = torch.FloatTensor(targets).to(self.device)
+        use_price_loss = close_prices is not None
+        if use_price_loss:
+            c_tensor = torch.FloatTensor(close_prices).to(self.device)  # (N,)
 
-        # Split into train/validation (90/10)
+        # Split into train/validation (90/10, chronological)
         split_idx = int(len(X_tensor) * 0.9)
         X_train, X_val = X_tensor[:split_idx], X_tensor[split_idx:]
         y_train, y_val = y_tensor[:split_idx], y_tensor[split_idx:]
+        if use_price_loss:
+            c_train = c_tensor[:split_idx]
+            c_val   = c_tensor[split_idx:]
+            train_dataset = TensorDataset(X_train, y_train, c_train)
+        else:
+            train_dataset = TensorDataset(X_train, y_train)
 
-        train_dataset = TensorDataset(X_train, y_train)
         train_loader = DataLoader(
             train_dataset, batch_size=batch_size, shuffle=True
         )
 
         criterion = nn.MSELoss()
 
-        # Training loop
+        def compute_loss(preds, tgts, close_vals=None):
+            """
+            Price-based MSE: reconstruct predicted and actual prices
+            from the anchor close, then compute MSE in price space.
+
+            pred_price  = close × (1 + model_output)
+            actual_price = close × (1 + target_pct)
+            loss = MSE(pred_price, actual_price)
+
+            Falls back to plain % change MSE when close_vals is None.
+            """
+            if close_vals is not None:
+                c = close_vals.unsqueeze(1)          # (batch, 1) → broadcasts over 6 horizons
+                pred_price   = c * (1.0 + preds)
+                actual_price = c * (1.0 + tgts)
+                return criterion(pred_price, actual_price)
+            return criterion(preds, tgts)
+
+        # Fresh scheduler per batch: prevents the patience counter from
+        # accumulating across all batches and driving the LR to zero.
+        # min_lr guards against the floor being reached and training
+        # stalling completely.
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode="min", factor=0.5, patience=10,
+            min_lr=1e-5
+        )
+
         history = {"train_loss": [], "val_loss": []}
         best_val_loss = float("inf")
+        best_model_state = None          # snapshot at best validation epoch
 
         for epoch in range(epochs):
-            # --- Training ---
+            # --- Training pass ---
             self.model.train()
             epoch_train_loss = 0.0
             num_batches = 0
 
-            for batch_X, batch_y in train_loader:
+            for batch_data in train_loader:
+                if use_price_loss:
+                    batch_X, batch_y, batch_c = batch_data
+                else:
+                    batch_X, batch_y = batch_data
+                    batch_c = None
+
                 self.optimizer.zero_grad()
                 predictions = self.model(batch_X)
-                loss = criterion(predictions, batch_y)
+                loss = compute_loss(predictions, batch_y, batch_c)
                 loss.backward()
 
                 # Gradient clipping to prevent exploding gradients
@@ -260,32 +315,48 @@ class StockTrainer:
 
             avg_train_loss = epoch_train_loss / max(num_batches, 1)
 
-            # --- Validation ---
+            # --- Validation pass ---
             self.model.eval()
             with torch.no_grad():
                 val_predictions = self.model(X_val)
-                val_loss = criterion(val_predictions, y_val).item()
+                val_loss = compute_loss(
+                    val_predictions, y_val,
+                    c_val if use_price_loss else None
+                ).item()
 
-            # Scheduler persists across batches — LR actually decreases
-            # over the full training run, not just within one batch
-            self.scheduler.step(val_loss)
+            # Scheduler is local to this batch — no cross-batch LR decay
+            scheduler.step(val_loss)
 
             history["train_loss"].append(avg_train_loss)
             history["val_loss"].append(val_loss)
 
+            # Snapshot weights at best validation epoch
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
+                best_model_state = {
+                    k: v.clone()
+                    for k, v in self.model.state_dict().items()
+                }
 
             if (epoch + 1) % 10 == 0 or epoch == 0:
                 current_lr = self.optimizer.param_groups[0]["lr"]
                 logger.info(
                     f"Epoch {epoch + 1}/{epochs} - "
-                    f"Train Loss: {avg_train_loss:.6f}, "
-                    f"Val Loss: {val_loss:.6f}, "
+                    f"Train Loss: {avg_train_loss:.4f}, "
+                    f"Val Loss: {val_loss:.4f}, "
                     f"LR: {current_lr:.2e}"
                 )
 
-        # Compute final detailed metrics
+        # Restore best-epoch weights before saving so we never persist
+        # an overfit checkpoint
+        if best_model_state is not None:
+            self.model.load_state_dict(best_model_state)
+            logger.info(
+                f"Restored best-epoch weights "
+                f"(val_loss={best_val_loss:.4f})"
+            )
+
+        # Compute final metrics on % change fractions for interpretability
         self.model.eval()
         with torch.no_grad():
             all_preds = self.model(X_tensor).cpu().numpy()
@@ -308,7 +379,7 @@ class StockTrainer:
             "sector": self.sector,
         }
 
-        # Save model + optimizer state after each batch for crash recovery
+        # Save best-epoch model + optimizer state for crash recovery
         # and cross-run persistence
         feature_names = FEATURE_COLUMNS.copy()
         feature_names.append("sector")
@@ -321,8 +392,9 @@ class StockTrainer:
         )
 
         logger.info(f"Batch training complete for {self.ticker}")
-        logger.info(f"  Final train loss: {training_info['final_train_loss']:.6f}")
-        logger.info(f"  Final val loss:   {training_info['final_val_loss']:.6f}")
+        logger.info(f"  Best val loss:    {training_info['best_val_loss']:.4f}")
+        logger.info(f"  Final train loss: {training_info['final_train_loss']:.4f}")
+        logger.info(f"  Final val loss:   {training_info['final_val_loss']:.4f}")
 
         return training_info
 
@@ -577,9 +649,10 @@ class StockTrainer:
                 f"{len(valid_indices)} valid anchor positions"
             )
 
-            # Build feature vectors and targets for this batch
+            # Build feature vectors, targets, and anchor close prices
             features_list = []
             targets_list = []
+            close_prices_list = []
 
             for i in valid_indices:
                 # 63-day lookback window of pre-computed features
@@ -599,6 +672,11 @@ class StockTrainer:
                 if target is not None:
                     features_list.append(flat)
                     targets_list.append(target)
+                    # Anchor close: used to reconstruct predicted prices
+                    # in the loss function (price-based MSE)
+                    close_prices_list.append(
+                        float(feat_df.iloc[i]["close"])
+                    )
 
             if not features_list:
                 logger.warning(
@@ -608,6 +686,7 @@ class StockTrainer:
 
             features = np.array(features_list, dtype=np.float32)
             targets = np.array(targets_list, dtype=np.float32)
+            close_prices = np.array(close_prices_list, dtype=np.float32)
             total_samples += len(features)
 
             logger.info(
@@ -617,7 +696,9 @@ class StockTrainer:
 
             # Train on this batch (weights carry forward)
             result = self.train_batch(
-                features, targets, epochs=epochs_per_batch
+                features, targets,
+                close_prices=close_prices,
+                epochs=epochs_per_batch,
             )
             if result:
                 result["batch_num"] = batch_num
