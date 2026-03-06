@@ -141,14 +141,17 @@ class ModelManager:
 
     def save_model(self, model: StockPredictorNet,
                    feature_names: list[str] = None,
-                   training_info: dict = None):
+                   training_info: dict = None,
+                   optimizer: torch.optim.Optimizer = None):
         """
-        Save universal model weights and architecture metadata.
+        Save universal model weights, optimizer state, and metadata.
 
         Args:
             model: The trained model
             feature_names: List of feature names for reproducibility
             training_info: Optional dict of training stats
+            optimizer: Optimizer whose state should be persisted for
+                       continued training across runs
         """
         weights_path = self._weights_path()
         meta_path = self._meta_path()
@@ -156,7 +159,7 @@ class ModelManager:
         # Save model state dict
         torch.save(model.state_dict(), weights_path)
 
-        # Save metadata
+        # Save metadata + optimizer state
         meta = {
             "input_size": model.input_size,
             "hidden_layers": model.hidden_layer_sizes,
@@ -164,6 +167,8 @@ class ModelManager:
             "feature_names": feature_names or [],
             "training_info": training_info or {},
         }
+        if optimizer is not None:
+            meta["optimizer_state_dict"] = optimizer.state_dict()
         torch.save(meta, meta_path)
 
         logger.info(f"Universal model saved -> {weights_path}")
@@ -245,6 +250,19 @@ class ModelManager:
 
         logger.info(f"Creating new universal model with input_size={input_size}")
         return StockPredictorNet(input_size, hidden_layers)
+
+    def get_saved_optimizer_state(self) -> Optional[dict]:
+        """
+        Load the optimizer state_dict from the saved metadata.
+
+        Returns:
+            Optimizer state_dict if saved, or None
+        """
+        meta_path = self._meta_path()
+        if not os.path.exists(meta_path):
+            return None
+        meta = torch.load(meta_path, weights_only=False)
+        return meta.get("optimizer_state_dict")
 
     def has_saved_model(self) -> bool:
         """Check if a universal model has been saved."""

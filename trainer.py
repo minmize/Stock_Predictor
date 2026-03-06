@@ -36,7 +36,9 @@ from sentiment import SentimentEvaluator
 from features import (
     compute_targets,
     encode_sector,
+    normalize_fundamentals,
     FEATURE_COLUMNS,
+    FUNDAMENTAL_KEYS,
     compute_technical_features,
 )
 from neural_net import ModelManager
@@ -126,33 +128,87 @@ class StockTrainer:
             return None
         return normalize_dataframe(df)
 
+    def _init_model_and_optimizer(self, input_size: int,
+                                  learning_rate: float = None):
+        """
+        Load or create the universal model and optimizer ONCE.
+
+        If a compatible saved model exists, loads it and restores
+        the optimizer state so that Adam's momentum and adaptive
+        learning rates carry forward across training runs.
+
+        Sets self.model and self.optimizer.
+
+        Args:
+            input_size: Number of input features
+            learning_rate: Learning rate for the optimizer
+        """
+        learning_rate = learning_rate or config.LEARNING_RATE
+
+        # Load or create model
+        self.model = self.model_manager.get_or_create_model(
+            input_size, self.hidden_layers
+        )
+        self.model = self.model.to(self.device)
+
+        # Create optimizer
+        self.optimizer = optim.Adam(
+            self.model.parameters(), lr=learning_rate, weight_decay=1e-5
+        )
+
+        # Restore saved optimizer state if available (carries momentum
+        # and adaptive learning rates from prior training runs)
+        saved_opt_state = self.model_manager.get_saved_optimizer_state()
+        if saved_opt_state is not None:
+            try:
+                self.optimizer.load_state_dict(saved_opt_state)
+                # Move optimizer state to device
+                for state in self.optimizer.state.values():
+                    for k, v in state.items():
+                        if isinstance(v, torch.Tensor):
+                            state[k] = v.to(self.device)
+                logger.info(
+                    "Restored optimizer state from previous training run"
+                )
+            except (ValueError, KeyError) as e:
+                logger.warning(
+                    f"Could not restore optimizer state (model architecture "
+                    f"may have changed): {e}. Starting fresh optimizer."
+                )
+
+        # Persistent scheduler across batches
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode="min", factor=0.5, patience=10
+        )
+
+        logger.info(
+            f"Model ready: {sum(p.numel() for p in self.model.parameters())} "
+            f"parameters, lr={learning_rate}"
+        )
+
     def train_batch(self, features: np.ndarray, targets: np.ndarray,
-                    epochs: int = None, learning_rate: float = None,
+                    epochs: int = None,
                     batch_size: int = None) -> dict:
         """
         Run the training loop for one batch of data.
+
+        Uses self.model and self.optimizer which must be initialized
+        by _init_model_and_optimizer() before calling this method.
+        The optimizer and its state persist across batch calls so that
+        Adam's momentum carries forward.
 
         Args:
             features: Feature matrix (num_samples, input_size)
             targets: Target matrix (num_samples, 6)
             epochs: Number of training epochs
-            learning_rate: Learning rate
             batch_size: Batch size
 
         Returns:
             Dict with training statistics
         """
         epochs = epochs or config.EPOCHS_PER_WINDOW
-        learning_rate = learning_rate or config.LEARNING_RATE
         batch_size = batch_size or config.BATCH_SIZE
 
-        input_size = features.shape[1]
-
-        # Get or create universal model
-        self.model = self.model_manager.get_or_create_model(
-            input_size, self.hidden_layers
-        )
-        self.model = self.model.to(self.device)
         self.model.train()
 
         # Prepare data loaders
@@ -169,14 +225,7 @@ class StockTrainer:
             train_dataset, batch_size=batch_size, shuffle=True
         )
 
-        # Loss function and optimizer
         criterion = nn.MSELoss()
-        optimizer = optim.Adam(
-            self.model.parameters(), lr=learning_rate, weight_decay=1e-5
-        )
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.5, patience=5
-        )
 
         # Training loop
         history = {"train_loss": [], "val_loss": []}
@@ -189,7 +238,7 @@ class StockTrainer:
             num_batches = 0
 
             for batch_X, batch_y in train_loader:
-                optimizer.zero_grad()
+                self.optimizer.zero_grad()
                 predictions = self.model(batch_X)
                 loss = criterion(predictions, batch_y)
                 loss.backward()
@@ -199,7 +248,7 @@ class StockTrainer:
                     self.model.parameters(), max_norm=1.0
                 )
 
-                optimizer.step()
+                self.optimizer.step()
                 epoch_train_loss += loss.item()
                 num_batches += 1
 
@@ -211,7 +260,9 @@ class StockTrainer:
                 val_predictions = self.model(X_val)
                 val_loss = criterion(val_predictions, y_val).item()
 
-            scheduler.step(val_loss)
+            # Scheduler persists across batches — LR actually decreases
+            # over the full training run, not just within one batch
+            self.scheduler.step(val_loss)
 
             history["train_loss"].append(avg_train_loss)
             history["val_loss"].append(val_loss)
@@ -220,10 +271,12 @@ class StockTrainer:
                 best_val_loss = val_loss
 
             if (epoch + 1) % 10 == 0 or epoch == 0:
+                current_lr = self.optimizer.param_groups[0]["lr"]
                 logger.info(
                     f"Epoch {epoch + 1}/{epochs} - "
                     f"Train Loss: {avg_train_loss:.6f}, "
-                    f"Val Loss: {val_loss:.6f}"
+                    f"Val Loss: {val_loss:.6f}, "
+                    f"LR: {current_lr:.2e}"
                 )
 
         # Compute final detailed metrics
@@ -249,12 +302,16 @@ class StockTrainer:
             "sector": self.sector,
         }
 
-        # Save universal model weights after each batch
+        # Save model + optimizer state after each batch for crash recovery
+        # and cross-run persistence
         feature_names = FEATURE_COLUMNS.copy()
         feature_names.append("sector")
-        feature_names.append("sentiment")
+        feature_names.append("ticker_sentiment")
+        feature_names.append("world_sentiment")
+        feature_names.extend(FUNDAMENTAL_KEYS)
         self.model_manager.save_model(
-            self.model, feature_names, training_info
+            self.model, feature_names, training_info,
+            optimizer=self.optimizer
         )
 
         logger.info(f"Batch training complete for {self.ticker}")
@@ -379,11 +436,34 @@ class StockTrainer:
             f"to {feat_df.iloc[last_valid_idx]['date'].date()})"
         )
 
-        # Get sentiment once for the entire run
+        # ----------------------------------------------------------
+        # Initialize model + optimizer ONCE before all batches.
+        # Input = (window * technical_features) + sector + ticker_sentiment
+        #         + world_sentiment + fundamental_metrics
+        # ----------------------------------------------------------
+        input_size = (
+            (window * len(FEATURE_COLUMNS))
+            + 1   # sector
+            + 1   # ticker sentiment
+            + 1   # world events sentiment
+            + len(FUNDAMENTAL_KEYS)  # fundamental metrics
+        )
+        self._init_model_and_optimizer(input_size)
+
+        # Fetch fundamental data once for the entire run
+        fundamentals = {}
+        try:
+            fundamentals = self.fetcher.fetch_financials(self.ticker)
+        except Exception as e:
+            logger.warning(f"Fundamentals fetch failed: {e}")
+        fundamental_values = normalize_fundamentals(fundamentals)
+
+        # Get sentiment once for the entire run (50 articles)
         sentiment_score = 0.0
+        world_sentiment_score = 0.0
         if self.use_sentiment:
             try:
-                news = self.fetcher.fetch_ticker_news(self.ticker, limit=20)
+                news = self.fetcher.fetch_ticker_news(self.ticker, limit=50)
                 sentiment_score = self.sentiment_evaluator.evaluate_sentiment(
                     self.ticker, news
                 )
@@ -392,6 +472,21 @@ class StockTrainer:
                 )
             except Exception as e:
                 logger.warning(f"Sentiment evaluation failed: {e}")
+
+            # World events / macro sentiment
+            try:
+                world_news = self.fetcher.fetch_market_news(limit=50)
+                world_sentiment_score = (
+                    self.sentiment_evaluator.evaluate_world_events(
+                        self.ticker, self.sector, world_news
+                    )
+                )
+                logger.info(
+                    f"World events sentiment for {self.ticker}: "
+                    f"{world_sentiment_score}"
+                )
+            except Exception as e:
+                logger.warning(f"World events sentiment failed: {e}")
 
         # Pre-compute values used for all batches
         sector_value = encode_sector(self.sector)
@@ -450,6 +545,8 @@ class StockTrainer:
                 flat = window_data.flatten()
                 flat = np.append(flat, sector_value)
                 flat = np.append(flat, sentiment_score)
+                flat = np.append(flat, world_sentiment_score)
+                flat = np.append(flat, fundamental_values)
 
                 # Forward-looking targets
                 target = compute_targets(feat_df, i)
