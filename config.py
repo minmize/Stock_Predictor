@@ -7,12 +7,12 @@ Fill in your API keys before running.
 # Massive (formerly Polygon.io) API Configuration
 # ============================================================
 # REST API key - obtain from https://massive.com/dashboard
-MASSIVE_API_KEY = "YOUR_MASSIVE_API_KEY_HERE"
+MASSIVE_API_KEY = "Sh6gU3i3rGPRqm9VLot4zERlzrphM35o"
 
 # ============================================================
 # Anthropic API Configuration
 # ============================================================
-ANTHROPIC_API_KEY = "YOUR_ANTHROPIC_API_KEY_HERE"
+ANTHROPIC_API_KEY = "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"
 ANTHROPIC_MODEL = "claude-sonnet-4-5-20250929"
 
 # ============================================================
