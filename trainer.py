@@ -4,20 +4,26 @@ Training mode module.
 Training process:
 1. Splits date range into 3-month batches (working backwards from end date)
 2. Discards any leftover time that doesn't fill a 3-month batch
-3. Fetches ALL data in one REST call (with buffers for indicator warm-up
-   at the start and forward targets at the end)
+3. Fetches ALL price data in one REST call (with buffers for indicator
+   warm-up at the start and forward targets at the end)
 4. Computes technical features once on the full dataset
-5. For each 3-month batch:
+5. Every 3 batches, refreshes time-appropriate context:
+   a. Fundamental data filed before the batch end date (no leakage)
+   b. Ticker sentiment from 10 historical news articles
+   c. World events sentiment from 10 historical market articles
+6. For each 3-month batch:
    a. Selects anchor days that fall within the batch date range
-   b. Builds training samples using pre-computed features (63-day lookback)
-      and forward targets (up to 63 days ahead) from the full dataset
+   b. Builds training samples using pre-computed features (63-day lookback),
+      historical fundamentals, historical sentiment, and forward targets
    c. Trains the universal neural network
    d. Weights carry forward between batches
-6. Saves universal weights to disk after each batch
+7. Saves universal weights + optimizer state to disk after each batch
 
 The model uses universal weights shared across all stocks. Sector
 information is encoded as a single normalized value in the input features.
 Default training range is 4 years back from the current date.
+
+Prediction mode uses current data: 50 news articles, latest financials.
 """
 
 import logging
@@ -450,46 +456,16 @@ class StockTrainer:
         )
         self._init_model_and_optimizer(input_size)
 
-        # Fetch fundamental data once for the entire run
-        fundamentals = {}
-        try:
-            fundamentals = self.fetcher.fetch_financials(self.ticker)
-        except Exception as e:
-            logger.warning(f"Fundamentals fetch failed: {e}")
-        fundamental_values = normalize_fundamentals(fundamentals)
-
-        # Get sentiment once for the entire run (50 articles)
-        sentiment_score = 0.0
-        world_sentiment_score = 0.0
-        if self.use_sentiment:
-            try:
-                news = self.fetcher.fetch_ticker_news(self.ticker, limit=50)
-                sentiment_score = self.sentiment_evaluator.evaluate_sentiment(
-                    self.ticker, news
-                )
-                logger.info(
-                    f"Sentiment score for {self.ticker}: {sentiment_score}"
-                )
-            except Exception as e:
-                logger.warning(f"Sentiment evaluation failed: {e}")
-
-            # World events / macro sentiment
-            try:
-                world_news = self.fetcher.fetch_market_news(limit=50)
-                world_sentiment_score = (
-                    self.sentiment_evaluator.evaluate_world_events(
-                        self.ticker, self.sector, world_news
-                    )
-                )
-                logger.info(
-                    f"World events sentiment for {self.ticker}: "
-                    f"{world_sentiment_score}"
-                )
-            except Exception as e:
-                logger.warning(f"World events sentiment failed: {e}")
-
         # Pre-compute values used for all batches
         sector_value = encode_sector(self.sector)
+
+        # Sentiment and fundamentals are refreshed every 3 batches
+        # using historical data from the batch's time period to
+        # avoid data leakage (no future information).
+        sentiment_score = 0.0
+        world_sentiment_score = 0.0
+        fundamental_values = normalize_fundamentals({})
+        _SENTIMENT_REFRESH_INTERVAL = 3
 
         all_results = []
         total_samples = 0
@@ -504,6 +480,70 @@ class StockTrainer:
                 f"{start_str} to {end_str}\n"
                 f"{'='*60}"
             )
+
+            # -------------------------------------------------------
+            # Refresh sentiment & fundamentals every 3 batches using
+            # data available AS OF the batch end date (no leakage).
+            # Training uses 10 articles per sentiment call.
+            # -------------------------------------------------------
+            if (batch_num - 1) % _SENTIMENT_REFRESH_INTERVAL == 0:
+                # Fundamentals: only filings filed before batch end
+                try:
+                    fundamentals = self.fetcher.fetch_financials(
+                        self.ticker, as_of_date=end_str
+                    )
+                    fundamental_values = normalize_fundamentals(fundamentals)
+                except Exception as e:
+                    logger.warning(
+                        f"Fundamentals fetch for {end_str} failed: {e}"
+                    )
+
+                if self.use_sentiment:
+                    # Ticker news published before batch end
+                    try:
+                        news = self.fetcher.fetch_ticker_news_historical(
+                            self.ticker, before_date=end_str, limit=10
+                        )
+                        sentiment_score = (
+                            self.sentiment_evaluator.evaluate_sentiment(
+                                self.ticker, news
+                            )
+                        )
+                        logger.info(
+                            f"Historical sentiment for {self.ticker} "
+                            f"as of {end_str}: {sentiment_score}"
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"Historical sentiment failed: {e}"
+                        )
+
+                    # World news published before batch end
+                    try:
+                        world_news = (
+                            self.fetcher.fetch_market_news_historical(
+                                before_date=end_str, limit=10
+                            )
+                        )
+                        world_sentiment_score = (
+                            self.sentiment_evaluator.evaluate_world_events(
+                                self.ticker, self.sector, world_news
+                            )
+                        )
+                        logger.info(
+                            f"Historical world sentiment as of "
+                            f"{end_str}: {world_sentiment_score}"
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"Historical world sentiment failed: {e}"
+                        )
+
+                logger.info(
+                    f"Refreshed context for batch {batch_num}: "
+                    f"sentiment={sentiment_score:.3f}, "
+                    f"world={world_sentiment_score:.3f}"
+                )
 
             # Find rows whose date falls within this batch's range.
             # These are the "anchor" days we build training samples around.
