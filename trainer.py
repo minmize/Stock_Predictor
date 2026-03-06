@@ -281,6 +281,9 @@ class StockTrainer:
                 return criterion(pred_price, actual_price)
             return criterion(preds, tgts)
 
+        # Learning rate is set proportionally to RMSE after each epoch:
+        #   lr = clamp(LR_SCALE × RMSE, MIN_LR, MAX_LR)
+        # High loss → high LR; as the model improves LR decays automatically.
         # Overshoot-recovery parameters.
         # When val_loss has risen for _OVERSHOOT_PATIENCE consecutive epochs
         # the model has passed the optimum.  We restore the last best weights,
@@ -333,6 +336,12 @@ class StockTrainer:
                     val_predictions, y_val,
                     c_val if use_price_loss else None
                 ).item()
+
+            # Proportional LR: RMSE (in price units) drives the learning rate
+            rmse = val_loss ** 0.5
+            new_lr = max(config.MIN_LR, min(config.MAX_LR, config.LR_SCALE * rmse))
+            for pg in self.optimizer.param_groups:
+                pg["lr"] = new_lr
 
             history["train_loss"].append(avg_train_loss)
             history["val_loss"].append(val_loss)

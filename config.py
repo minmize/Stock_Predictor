@@ -61,7 +61,10 @@ PREDICTION_HORIZONS = {
 }
 
 # Training parameters
-LEARNING_RATE = 0.001
+LEARNING_RATE = 0.001          # initial LR (also serves as MAX_LR default)
+LR_SCALE      = 1e-4           # lr = clamp(LR_SCALE × RMSE, MIN_LR, MAX_LR)
+MIN_LR        = 1e-5           # floor — prevents training from stalling
+MAX_LR        = 1e-2           # ceiling — prevents instability at high loss
 EPOCHS_PER_WINDOW = 50
 BATCH_SIZE = 32
 TRAINING_WINDOW_DAYS = 63  # 3 months of trading days
