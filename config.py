@@ -1,18 +1,23 @@
 """
 Configuration for Stock Predictor.
-Fill in your API keys before running.
+Set API keys via environment variables — do not hardcode them here.
+
+  export MASSIVE_API_KEY="your-key"
+  export ANTHROPIC_API_KEY="your-key"
 """
+
+import os
 
 # ============================================================
 # Massive (formerly Polygon.io) API Configuration
 # ============================================================
 # REST API key - obtain from https://massive.com/dashboard
-MASSIVE_API_KEY = "Sh6gU3i3rGPRqm9VLot4zERlzrphM35o"
+MASSIVE_API_KEY = os.environ.get("MASSIVE_API_KEY", "")
 
 # ============================================================
 # Anthropic API Configuration
 # ============================================================
-ANTHROPIC_API_KEY = "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"
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = "claude-sonnet-4-5-20250929"
 
 # ============================================================
